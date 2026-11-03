@@ -9,36 +9,36 @@ from frontend.ui_score import LAYER_INFO, render_score_gauge
 
 
 def show_compare_tab():
-    st.markdown("### ⚖️ เปรียบเทียบ 2 หุ้น")
+    st.markdown("### Comparing 2 stocks")
 
     col1, col2 = st.columns(2)
     with col1:
         ticker_a = st.text_input(
-            "หุ้นตัวที่ 1", placeholder="เช่น AAPL", key="cmp_a"
+            "Stock 1", placeholder="e.g. AAPL", key="cmp_a"
         ).strip().upper()
     with col2:
         ticker_b = st.text_input(
-            "หุ้นตัวที่ 2", placeholder="เช่น PTT.BK", key="cmp_b"
+            "Stock 2", placeholder="e.g. PTT.BK", key="cmp_b"
         ).strip().upper()
 
-    if st.button("🔍 เปรียบเทียบ", width="stretch"):
+    if st.button("Compare", width="stretch"):
         if ticker_a and ticker_b:
-            with st.spinner("กำลังวิเคราะห์..."):
+            with st.spinner("Analyzing..."):
                 result_a = None
                 result_b = None
                 try:
                     result_a = run_full_analysis(ticker_a)
                 except Exception as exc:
-                    st.error(f"วิเคราะห์ {ticker_a} ไม่สำเร็จ: {exc}")
+                    st.error(f"Failed to analyze {ticker_a}: {exc}")
                 try:
                     result_b = run_full_analysis(ticker_b)
                 except Exception as exc:
-                    st.error(f"วิเคราะห์ {ticker_b} ไม่สำเร็จ: {exc}")
+                    st.error(f"Failed to analyze {ticker_b}: {exc}")
 
             if result_a and result_b:
                 _render_comparison(ticker_a, result_a, ticker_b, result_b)
         else:
-            st.warning("กรุณาใส่ชื่อหุ้นทั้ง 2 ตัว")
+            st.warning("Please enter both stock tickers.")
 
 
 def _render_comparison(ticker_a, res_a, ticker_b, res_b):
@@ -57,7 +57,7 @@ def _render_comparison(ticker_a, res_a, ticker_b, res_b):
 
     # Layer-by-layer comparison table -- reuse the app's real layer names
     # (ui_score.LAYER_INFO) rather than a separate, inconsistent label set.
-    st.markdown("#### เปรียบเทียบแต่ละ Layer")
+    st.markdown("#### Layer-by-Layer Comparison")
 
     header = st.columns([2, 1.5, 1.5])
     header[0].markdown("**Layer**")
@@ -97,7 +97,7 @@ def _render_comparison(ticker_a, res_a, ticker_b, res_b):
         <div style="background:#0F2D1A; border:1px solid #00C896;
                     border-radius:10px; padding:1rem; text-align:center;">
             <span style="font-size:1.2rem; color:#00C896; font-weight:800;">
-                🏆 {winner} ชนะ (+{score_diff:.1f} คะแนน)
+                🏆 {winner} wins (+{score_diff:.1f} points)
             </span>
         </div>
         """, unsafe_allow_html=True)

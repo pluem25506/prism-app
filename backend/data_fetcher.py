@@ -1,4 +1,5 @@
 import functools
+import time
 
 import pandas as pd
 import yfinance as yf
@@ -6,6 +7,41 @@ import yfinance as yf
 TICKER_NOT_FOUND_MESSAGE = (
     "Ticker not found. Please use a valid SET ticker (e.g. PTT.BK) or US ticker (e.g. AAPL)."
 )
+
+# Yahoo's quoteSummary endpoint (backs .info) occasionally hands back a
+# near-empty dict on a transient rate-limit/cookie-negotiation hiccup --
+# much more common from shared cloud IP ranges like Streamlit Community
+# Cloud's than from a home connection -- even though the request itself
+# "succeeds" (no exception). .history()/.download() use a separate, less
+# restrictive endpoint and keep working fine during the same hiccup, which
+# is why prices/charts are fine while the company-profile fields go blank.
+# Retry once before accepting a suspiciously empty result.
+_INFO_RETRY_ATTEMPTS = 3
+_INFO_RETRY_DELAY_S = 2.0
+
+
+def _looks_like_real_info(info: dict) -> bool:
+    if not info:
+        return False
+    return any(
+        info.get(k) is not None
+        for k in ("regularMarketPrice", "currentPrice", "longName", "shortName")
+    )
+
+
+def _fetch_info_with_retry(stock) -> dict:
+    last = None
+    for attempt in range(_INFO_RETRY_ATTEMPTS):
+        try:
+            info = stock.info
+        except Exception:
+            info = None
+        if _looks_like_real_info(info):
+            return info
+        last = info
+        if attempt < _INFO_RETRY_ATTEMPTS - 1:
+            time.sleep(_INFO_RETRY_DELAY_S)
+    return last
 
 
 class TickerNotFoundError(ValueError):
@@ -30,7 +66,7 @@ def fetch_stock_data(ticker: str) -> dict:
     data = {}
 
     try:
-        data["info"] = stock.info
+        data["info"] = _fetch_info_with_retry(stock)
     except Exception:
         data["info"] = None
 
@@ -38,6 +74,15 @@ def fetch_stock_data(ticker: str) -> dict:
         data["history_1y"] = stock.history(period="1y")
     except Exception:
         data["history_1y"] = None
+
+    # If .info came back without even a price (the quoteSummary hiccup
+    # described above), backfill from .history(), which has proven more
+    # reliable on cloud hosts -- better a real price than a blank "N/A".
+    if data["info"] is not None and data["history_1y"] is not None and not data["history_1y"].empty:
+        if data["info"].get("currentPrice") is None and data["info"].get("regularMarketPrice") is None:
+            last_close = data["history_1y"]["Close"].dropna()
+            if not last_close.empty:
+                data["info"]["currentPrice"] = float(last_close.iloc[-1])
 
     try:
         data["history_3y"] = stock.history(period="3y")

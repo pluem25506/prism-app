@@ -37,18 +37,18 @@ def render_score_gauge(score: float, signal: str):
     """Render a filled-donut-segment speedometer gauge for PRISM Score 0-100."""
     if signal == "BUY":
         color = "#00C896"
-        label = "BUY 🟢"
+        label = "BUY"
     elif signal == "HOLD":
         color = "#D4A017"
-        label = "HOLD 🟡"
+        label = "HOLD"
     elif signal == "MIXED SIGNAL":
         # Not a SELL -- valuation models disagree, so give it its own neutral
         # color rather than falsely painting it red.
         color = "#8899AA"
-        label = "MIXED SIGNAL ⚠️"
+        label = "MIXED SIGNAL"
     else:
         color = "#FF4757"
-        label = "SELL 🔴"
+        label = "SELL"
 
     CX, CY = 170, 170
     R_OUTER, R_INNER = 130, 95
@@ -219,4 +219,4 @@ def render_score_card(result: dict):
 
     # Mixed signal warning
     if signal == "MIXED SIGNAL":
-        st.warning("⚠️ Valuation models disagree — exercise additional due diligence before deciding.")
+        st.warning("Valuation models disagree — exercise additional due diligence before deciding.")

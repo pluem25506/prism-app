@@ -105,7 +105,7 @@ def render_ai_summary(result: dict, lang: str = "en"):
                     margin:12px 0;">
           <div style="color:#D4A017; font-size:11px;
                       letter-spacing:1px; margin-bottom:8px">
-            🤖 AI QUANTITATIVE SUMMARY
+            AI QUANTITATIVE SUMMARY
           </div>
           <div style="color:#FFFFFF; font-size:14px; line-height:1.7">
             {summary_html}
@@ -114,4 +114,4 @@ def render_ai_summary(result: dict, lang: str = "en"):
         """,
         unsafe_allow_html=True,
     )
-    st.caption("⚠️ AI summary reads quantitative output only. Not investment advice.")
+    st.caption("AI summary reads quantitative output only. Not investment advice.")

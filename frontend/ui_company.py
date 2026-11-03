@@ -17,13 +17,6 @@ _SECTOR_PILL_STYLES = {
 }
 _DEFAULT_PILL_STYLE = ("#1E3A5F", "#8899AA")  # gray
 
-_COUNTRY_FLAGS = {
-    "Thailand": "🇹🇭",
-    "United States": "🇺🇸",
-}
-_DEFAULT_FLAG = "🌍"
-
-
 def format_market_cap(value, symbol: str = "฿") -> str:
     if value is None:
         return "N/A"
@@ -71,7 +64,6 @@ def render_company_profile(ticker: str, info: dict):
     yield_str = f"{div_yield * 100:.2f}%" if div_yield else "No dividend"
 
     pill_bg, pill_color = _sector_pill_style(sector)
-    flag = _COUNTRY_FLAGS.get(country, _DEFAULT_FLAG)
 
     # yfinance text fields (longName, sector, etc.) can contain "&", "<" etc.
     # (e.g. "AT&T Inc.") -- escape before embedding in raw HTML.
@@ -108,7 +100,7 @@ def render_company_profile(ticker: str, info: dict):
             <span style="font-size:20px; font-weight:700; color:#FFFFFF;">{name_esc}</span>
             <span style="background:{pill_bg}; color:{pill_color}; padding:4px 12px;
                          border-radius:12px; font-size:12px; font-weight:600;">{sector_esc}</span>
-            <span style="font-size:14px; color:{_TEXT_SECONDARY};">{flag} {country_esc}</span>
+            <span style="font-size:14px; color:{_TEXT_SECONDARY};">{country_esc}</span>
           </div>
           <div style="color:{_TEXT_SECONDARY}; font-size:13px; margin-bottom:16px;">{industry_esc}</div>
 

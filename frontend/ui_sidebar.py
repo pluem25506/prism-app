@@ -14,7 +14,7 @@ def render_sidebar() -> tuple[str, bool]:
         clicked = st.button("Analyze", type="primary", width="stretch")
 
         if st.session_state.get("run_analysis"):
-            if st.button("← Home", width="stretch"):
+            if st.button("Home", width="stretch"):
                 st.session_state["run_analysis"] = False
                 st.session_state["selected_ticker"] = ""
                 st.rerun()

@@ -9,7 +9,7 @@ import streamlit as st
 import yfinance as yf
 
 WATCHLIST = {
-    "🇹🇭 Thai Stocks": [
+    "Thai Stocks": [
         {"ticker": "PTT.BK", "name": "PTT"},
         {"ticker": "AOT.BK", "name": "Airports of Thailand"},
         {"ticker": "ADVANC.BK", "name": "Advanced Info Service"},
@@ -19,7 +19,7 @@ WATCHLIST = {
         {"ticker": "DELTA.BK", "name": "Delta Electronics"},
         {"ticker": "BBL.BK", "name": "Bangkok Bank"},
     ],
-    "🇺🇸 US Stocks": [
+    "US Stocks": [
         {"ticker": "AAPL", "name": "Apple"},
         {"ticker": "MSFT", "name": "Microsoft"},
         {"ticker": "NVDA", "name": "NVIDIA"},
@@ -63,7 +63,7 @@ def fetch_card_data(ticker: str) -> dict:
 def _render_pulse_card(ticker: str, name: str, data):
     """Render a single Market Pulse card."""
     if data is None:
-        st.error(f"❌ {ticker}")
+        st.error(f"{ticker}")
         return
 
     price = data["price"]
@@ -133,7 +133,7 @@ def show_landing_page():
     st.markdown("""
     <div style="text-align:center; padding: 2rem 0 1rem;">
         <h1 style="font-size:2.5rem; font-weight:800; margin:0;">
-            📊 PRISM <span style="color:#D4A017;">v2.1</span>
+            PRISM <span style="color:#D4A017;">v2.1</span>
         </h1>
         <p style="color:#888; font-size:1.1rem; margin-top:0.5rem;">
             Quantitative Stock Analysis · 9-Layer Framework
@@ -151,7 +151,7 @@ def show_landing_page():
             key="landing_search",
         )
     with col_btn:
-        if st.button("🔍 Analyze", width="stretch"):
+        if st.button("Analyze", width="stretch"):
             if quick_ticker.strip():
                 st.session_state["selected_ticker"] = quick_ticker.strip().upper()
                 st.session_state["run_analysis"] = True

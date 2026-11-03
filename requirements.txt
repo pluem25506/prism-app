@@ -1,0 +1,10 @@
+streamlit>=1.32
+yfinance>=0.2.36
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
+arch>=6.3
+plotly>=5.20
+reportlab>=4.1
+google-genai>=1.0.0
+fredapi>=0.5.0

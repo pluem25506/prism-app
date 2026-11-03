@@ -82,7 +82,7 @@ def _generate_summary(prompt: str) -> str:
 
 
 def render_ai_summary(result: dict, lang: str = "en"):
-    st.markdown("### 🤖 AI Summary")
+    st.markdown("### AI Summary")
 
     col1, col2 = st.columns([1, 4])
     with col1:

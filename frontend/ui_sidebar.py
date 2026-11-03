@@ -11,7 +11,7 @@ def render_sidebar() -> tuple[str, bool]:
             value=st.session_state.get("selected_ticker") or "PTT.BK",
             help="Use .BK suffix for SET stocks: PTT.BK, KBANK.BK, AOT.BK",
         )
-        clicked = st.button("🔍 Analyze", type="primary", width="stretch")
+        clicked = st.button("Analyze", type="primary", width="stretch")
 
         if st.session_state.get("run_analysis"):
             if st.button("← Home", width="stretch"):
@@ -20,7 +20,7 @@ def render_sidebar() -> tuple[str, bool]:
                 st.rerun()
 
         st.markdown("---")
-        st.markdown("### 📊 My Portfolio (for L7)")
+        st.markdown("### My Portfolio")
 
         if "portfolio" not in st.session_state:
             st.session_state["portfolio"] = []

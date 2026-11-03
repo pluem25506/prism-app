@@ -97,7 +97,7 @@ def _render_comparison(ticker_a, res_a, ticker_b, res_b):
         <div style="background:#0F2D1A; border:1px solid #00C896;
                     border-radius:10px; padding:1rem; text-align:center;">
             <span style="font-size:1.2rem; color:#00C896; font-weight:800;">
-                🏆 {winner} wins (+{score_diff:.1f} points)
+                {winner} wins (+{score_diff:.1f} points)
             </span>
         </div>
         """, unsafe_allow_html=True)

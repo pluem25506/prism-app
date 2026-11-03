@@ -31,7 +31,7 @@ def render_sidebar() -> tuple[str, bool]:
                 new_ticker = st.text_input("Ticker", key="port_ticker", placeholder="e.g. PTT.BK")
             with col2:
                 new_shares = st.number_input("Shares", min_value=0.0, step=100.0, key="port_shares")
-            if st.button("➕ Add to Portfolio"):
+            if st.button("Add to Portfolio"):
                 if new_ticker:
                     st.session_state["portfolio"].append({
                         "ticker": new_ticker.upper().strip(),
@@ -45,7 +45,7 @@ def render_sidebar() -> tuple[str, bool]:
                 hcol1, hcol2, hcol3 = st.columns([3, 2, 1])
                 hcol1.write(h["ticker"])
                 hcol2.write(f"{h['shares']:,.0f} shares")
-                if hcol3.button("✕", key=f"del_{i}"):
+                if hcol3.button("x", key=f"del_{i}"):
                     st.session_state["portfolio"].pop(i)
                     st.rerun()
         else:

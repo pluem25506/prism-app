@@ -91,7 +91,7 @@ with tab_compare:
 
 st.divider()
 st.caption(
-    "⚠️ PRISM is a quantitative decision-support tool only. "
+    "PRISM is a quantitative decision-support tool only. "
     "Not investment advice. All models carry assumptions — "
     "verify before acting. For educational purposes only."
 )

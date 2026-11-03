@@ -12,7 +12,6 @@ from backend.prism_score import compute_prism_score
 
 st.set_page_config(
     page_title="PRISM v2.1 | Quantitative Investment Analysis",
-    page_icon="📊",
     layout="wide",
 )
 
@@ -44,7 +43,7 @@ if clicked or auto_run:
             st.session_state["result"] = None
             st.error(f"Failed to analyze {ticker}: {exc}")
 
-tab_main, tab_compare = st.tabs(["📊 วิเคราะห์", "⚖️ เปรียบเทียบ"])
+tab_main, tab_compare = st.tabs(["Analyze", "Compare"])
 
 with tab_main:
     if not st.session_state.get("run_analysis", False):

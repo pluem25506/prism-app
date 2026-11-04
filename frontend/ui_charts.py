@@ -109,35 +109,25 @@ def render_risk_table(risk_result: dict):
     st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
 
 
-def render_esg_table(l8_result: dict):
+def render_leverage_table(l8_result: dict):
     data_quality = l8_result.get("data_quality", "N/A")
 
-    if data_quality == "FULL":
-        data = {
-            "Metric": ["ESG Risk Score", "Environment", "Social", "Governance", "Controversy"],
-            "Value": [
-                f"{l8_result.get('total_esg', 'N/A')}",
-                f"{l8_result.get('env_score', 'N/A')}",
-                f"{l8_result.get('social_score', 'N/A')}",
-                f"{l8_result.get('gov_score', 'N/A')}",
-                f"{l8_result.get('controversy', 'N/A')}",
-            ],
-        }
-        st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
-    elif data_quality == "PROXY":
-        data = {
-            "Metric": ["Dividend Yield", "Debt/Equity", "Data Quality"],
-            "Value": [
-                f"{l8_result.get('div_yield', 'N/A')}%",
-                f"{l8_result.get('de_ratio', 'N/A')}",
-                "PROXY (governance proxy)",
-            ],
-        }
-        st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
-        for note in l8_result.get("details", []):
-            st.caption(f"• {note}")
-    else:
-        st.caption("ESG data not available for this ticker — defaulted to neutral score.")
+    if data_quality == "stub":
+        st.caption("Not enough year-over-year fundamentals to compute operating/financial leverage — defaulted to neutral score.")
+        return
+
+    data = {
+        "Metric": ["DOL (Operating Leverage)", "DFL (Financial Leverage)", "DTL (Total Leverage)", "Data Quality"],
+        "Value": [
+            f"{l8_result.get('dol', 'N/A')}",
+            f"{l8_result.get('dfl', 'N/A')}",
+            f"{l8_result.get('dtl', 'N/A')}",
+            data_quality,
+        ],
+    }
+    st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
+    for note in l8_result.get("details", []):
+        st.caption(f"• {note}")
 
 
 def render_contextual_intel(l9_result: dict):

@@ -10,7 +10,7 @@ LAYER_INFO = {
     "S5": ("L5", "Monte Carlo", 0.10),
     "S6": ("L6", "Time-Series", 0.05),
     "S7": ("L7", "Portfolio Fit", 0.05),
-    "S8": ("L8", "Responsible AI", 0.05),
+    "S8": ("L8", "Op./Fin. Leverage", 0.05),
     "S9": ("L9", "Contextual Intel", 0.05),
 }
 

@@ -4,7 +4,7 @@ from frontend.ui_sidebar import render_sidebar
 from frontend.ui_theme import inject_sidebar_nav_style
 from frontend.ui_company import render_company_profile
 from frontend.ui_score import render_score_card
-from frontend.ui_charts import render_contextual_intel, render_esg_table, render_montecarlo_chart, render_risk_table, render_score_bar
+from frontend.ui_charts import render_contextual_intel, render_leverage_table, render_montecarlo_chart, render_risk_table, render_score_bar
 from frontend.ui_ai_summary import render_ai_summary
 from frontend.ui_landing import show_landing_page
 from frontend.ui_compare import show_compare_tab
@@ -81,8 +81,8 @@ with tab_main:
             with right_col:
                 render_montecarlo_chart(result["layer_details"]["L5"], result["ticker"])
                 render_risk_table(result["layer_details"]["L4"])
-                st.markdown("**Responsible AI / ESG (L8)**")
-                render_esg_table(result["layer_details"]["L8"])
+                st.markdown("**Operating & Financial Leverage (L8)**")
+                render_leverage_table(result["layer_details"]["L8"])
                 st.markdown("**Contextual Intelligence (L9)**")
                 render_contextual_intel(result["layer_details"]["L9"])
 

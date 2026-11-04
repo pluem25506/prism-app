@@ -1,638 +1,50 @@
 """
-PRISM Backtest Engine -- scoring + simulation core.
+PRISM Backtest Engine -- simulation harness only.
 
-Independent of backend/ (the live 9-layer analyzer): this module scores a
-ticker YEAR BY YEAR from annual fundamentals + daily price data, for the
-standalone Backtest page. Layer names/weights are specific to this engine
-and are not the same L1-L9 as the live app.
+As of this rewrite, the actual 9-layer scoring is no longer a separate
+parallel implementation here -- it calls backend.prism_score.compute_prism_score
+(ticker, year), the exact same scorer the live Analyze page uses, just
+pointed at a historical fiscal year instead of today. This module now only
+owns what's specific to backtesting: fetching a long price history, running
+the year-by-year scoring loop, simulating the BUY/HOLD/SELL strategy at each
+rebalance date, building the equity curve, and computing summary stats.
 
-Known data limitation: yfinance's free annual financials/balance_sheet/
-cashflow only go back ~4 fiscal years, even when a 10-20 year price history
-is available. Years outside that window simply have no fundamentals --
-compute_prism_score() degrades gracefully for those years (skips the
-layers that need them and renormalizes the rest) rather than crashing or
-guessing.
+L7 Portfolio Fit is always unavailable here (it depends on the user's
+*current* holdings, which has no historical meaning) -- backend.prism_score
+already returns S7=None for any explicit year, and the composite score
+renormalizes around it automatically, same as any other missing layer.
 """
 
-import functools
-import time
-
-import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-try:
-    from fredapi import Fred
-    FRED_AVAILABLE = True
-except ImportError:
-    FRED_AVAILABLE = False
+from backend.data_fetcher import fetch_price_history_long
+from backend.prism_score import WEIGHTS, compute_prism_score
 
 DEFAULT_RISK_FREE_RATE = 0.04
 
-# Simplified DCF assumptions (same style as backend/layer2_value.py's
-# industry-median WACC fallback): a 9% discount rate and a 2.5% terminal
-# growth rate, applied to operating cash flow as a stand-in for free cash
-# flow (capex isn't fetched, so this is FCF-light, not true unlevered FCF --
-# documented simplification, not an attempt at a precise DCF).
-_DCF_WACC = 0.09
-_DCF_TERMINAL_GROWTH = 0.025
-
-LAYER_WEIGHTS = {
-    "L1_valuation": 0.15,
-    "L2_profitability": 0.15,
-    "L3_growth": 0.15,
-    "L4_safety": 0.10,
-    "L5_efficiency": 0.10,
-    "L6_dividends": 0.05,
-    "L7_momentum": 0.15,
-    "L8_esg": 0.05,
-    "L9_relative_strength": 0.10,
+LAYER_LABELS = {
+    "S1": "Quality Screen", "S2": "Value Creation", "S3": "Valuation",
+    "S4": "Risk & Leverage", "S5": "Monte Carlo", "S6": "Time-Series Momentum",
+    "S7": "Portfolio Fit (N/A historically)", "S8": "Operating & Financial Leverage",
+    "S9": "Contextual Intelligence",
 }
 
-# Bitcoin and other non-equity tickers have no fundamentals at all -- rescale
-# onto the two layers that still make sense (price momentum + relative
-# strength) rather than reporting a near-zero score dragged down by five
-# permanently-missing layers.
-NO_FUNDAMENTALS_WEIGHTS = {
-    "L7_momentum": 0.60,
-    "L9_relative_strength": 0.40,
-}
-
-
-# ---------------------------------------------------------------------------
-# Data fetching
-# ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600)
 def fetch_stock_data(ticker: str, period_years) -> pd.DataFrame:
     """Daily OHLCV for `ticker`. `period_years` is an int, or "max" for the
     full available history."""
     period = "max" if period_years == "max" else f"{int(period_years)}y"
-    tk = yf.Ticker(ticker)
-    df = tk.history(period=period, interval="1d")
-    if df is None or df.empty:
+    df = fetch_price_history_long(ticker, period=period)
+    if df.empty:
         raise ValueError(f"Ticker '{ticker}' not found on yfinance, or has no price history.")
-    # Crypto (BTC-USD) trades in UTC while equities trade in America/New_York
-    # -- reindex()/comparisons between a crypto series and an equity
-    # benchmark would otherwise compare absolute instants across two
-    # different tz offsets and barely ever match. Drop to calendar-date-only,
-    # tz-naive, so every series in the engine lines up on the same axis.
-    df.index = df.index.tz_localize(None).normalize()
-    df = df[~df.index.duplicated(keep="last")]
-    return df.dropna(subset=["Close"])
-
-
-def _item_row(df, keywords):
-    """Fuzzy row lookup in a financials/balance_sheet/cashflow DataFrame."""
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-    normalized_keywords = [kw.lower().replace(" ", "") for kw in keywords]
-    for row_label in df.index:
-        row_norm = str(row_label).lower().replace(" ", "")
-        for kw in normalized_keywords:
-            if kw in row_norm or row_norm in kw:
-                return df.loc[row_label]
-    return None
+    return df
 
 
 @st.cache_data(ttl=3600)
-def fetch_fundamentals_annual(ticker: str) -> dict:
-    """Annual fundamentals keyed by fiscal year (int). See module docstring
-    for the ~4-year yfinance limitation; missing years simply aren't keys
-    in the returned dict."""
-    tk = yf.Ticker(ticker)
-
-    def safe(attr):
-        try:
-            return getattr(tk, attr)
-        except Exception:
-            return None
-
-    financials = safe("financials")
-    balance_sheet = safe("balance_sheet")
-    cashflow = safe("cashflow")
-    info = safe("info") or {}
-
-    rows = {
-        "revenue": _item_row(financials, ["Total Revenue", "TotalRevenue"]),
-        "net_income": _item_row(financials, ["Net Income", "NetIncome", "Net Income Common Stockholders"]),
-        "ebitda": _item_row(financials, ["EBITDA", "Normalized EBITDA"]),
-        "ebit": _item_row(financials, ["EBIT", "Operating Income"]),
-        "interest_expense": _item_row(financials, ["Interest Expense"]),
-        "cost_of_revenue": _item_row(financials, ["Cost Of Revenue", "Cost Of Goods Sold", "Reconciled Cost Of Revenue"]),
-        "total_assets": _item_row(balance_sheet, ["Total Assets"]),
-        "total_equity": _item_row(balance_sheet, ["Total Stockholder Equity", "Stockholders Equity", "Total Equity Gross Minority Interest"]),
-        "total_debt": _item_row(balance_sheet, ["Total Debt"]),
-        "cash": _item_row(balance_sheet, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"]),
-        "current_assets": _item_row(balance_sheet, ["Total Current Assets", "Current Assets"]),
-        "current_liabilities": _item_row(balance_sheet, ["Total Current Liabilities", "Current Liabilities"]),
-        "inventory": _item_row(balance_sheet, ["Inventory"]),
-        "operating_cashflow": _item_row(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities", "Cash Flow From Continuing Operating Activities"]),
-        "retained_earnings": _item_row(balance_sheet, ["Retained Earnings"]),
-        "total_liabilities": _item_row(balance_sheet, ["Total Liabilities Net Minority Interest", "Total Liab"]),
-        "accounts_receivable": _item_row(balance_sheet, ["Receivables", "Accounts Receivable", "Net Receivables"]),
-    }
-
-    years = set()
-    for row in rows.values():
-        if row is not None:
-            years.update(c.year for c in row.index)
-
-    shares_out = info.get("sharesOutstanding")
-
-    data = {}
-    for year in years:
-        def val(row, _year=year):
-            if row is None:
-                return None
-            for c in row.index:
-                if c.year == _year:
-                    v = row[c]
-                    return float(v) if pd.notna(v) else None
-            return None
-
-        data[year] = {key: val(row) for key, row in rows.items()}
-        data[year]["shares_outstanding"] = shares_out
-
-    return data
-
-
-@st.cache_data(ttl=3600)
-def fetch_dividends(ticker: str) -> pd.Series:
-    try:
-        return yf.Ticker(ticker).dividends
-    except Exception:
-        return pd.Series(dtype=float)
-
-
-@st.cache_data(ttl=3600)
-def fetch_sustainability_score(ticker: str):
-    """Best-effort ESG score 0-100 (higher=better), or None if unavailable.
-
-    Yahoo deprecated the underlying Sustainalytics endpoint -- confirmed
-    empty for essentially every ticker as of late 2026 -- so this will
-    almost always fall through to None, matching the Part 4 spec's "do NOT
-    penalize" handling in compute_prism_score.
-    """
-    try:
-        sus = yf.Ticker(ticker).sustainability
-        if sus is None or sus.empty or "totalEsg" not in sus.index:
-            return None
-        total_esg = float(sus.loc["totalEsg", "Value"])
-        # Sustainalytics risk score: 0 (best) - 40+ (worst) -> 100-0 scale.
-        return max(0.0, min(100.0, 100 - total_esg * 2.5))
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=3600)
-def fetch_macro_data(start_year: int, end_year: int) -> dict:
-    """{year: {"risk_free_rate": float, "unemployment": float}}. Falls back
-    to a flat 4% risk-free rate for every year if FRED is unavailable --
-    never raises."""
-    fred_key = None
-    try:
-        fred_key = st.secrets.get("FRED_API_KEY")
-    except Exception:
-        pass
-
-    fallback = {y: {"risk_free_rate": DEFAULT_RISK_FREE_RATE, "unemployment": None} for y in range(start_year, end_year + 1)}
-
-    if not fred_key or not FRED_AVAILABLE:
-        return fallback
-
-    try:
-        fred = Fred(api_key=fred_key)
-        dgs10 = fred.get_series("DGS10").dropna()
-        unrate = fred.get_series("UNRATE").dropna()
-    except Exception:
-        return fallback
-
-    result = {}
-    for year in range(start_year, end_year + 1):
-        try:
-            year_rate = dgs10[dgs10.index.year == year]
-            rf = float(year_rate.mean()) / 100 if not year_rate.empty else DEFAULT_RISK_FREE_RATE
-        except Exception:
-            rf = DEFAULT_RISK_FREE_RATE
-        try:
-            year_unrate = unrate[unrate.index.year == year]
-            unemployment = float(year_unrate.mean()) if not year_unrate.empty else None
-        except Exception:
-            unemployment = None
-        result[year] = {"risk_free_rate": rf, "unemployment": unemployment}
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Scoring helpers
-# ---------------------------------------------------------------------------
-
-def _linear_score(value, good, bad, higher_is_better=True):
-    """Map `value` onto 0-100 between the `bad` and `good` anchors."""
-    if value is None:
-        return None
-    if good == bad:
-        return 100.0 if (value >= good) == higher_is_better else 0.0
-    frac = (value - bad) / (good - bad)
-    return float(max(0.0, min(1.0, frac)) * 100)
-
-
-def _average(scores):
-    present = [s for s in scores if s is not None]
-    return float(np.mean(present)) if present else None
-
-
-def _weighted_average(pairs):
-    """pairs: [(score_or_None, weight), ...]. Missing scores are dropped and
-    the remaining weights renormalized, so a layer with some unavailable
-    sub-metrics still scores fairly on whatever it does have."""
-    present = [(score, weight) for score, weight in pairs if score is not None]
-    if not present:
-        return None
-    total_weight = sum(weight for _, weight in present)
-    if total_weight == 0:
-        return None
-    return float(sum(score * weight for score, weight in present) / total_weight)
-
-
-def _rsi(closes: pd.Series, period: int = 14):
-    if len(closes) < period + 1:
-        return None
-    delta = closes.diff().dropna()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean().iloc[-1]
-    avg_loss = loss.rolling(period).mean().iloc[-1]
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return float(100 - (100 / (1 + rs)))
-
-
-def _macd_score(closes: pd.Series):
-    """Same 12/26 EMA, 9-period signal line as backend/layer6_momentum.py's
-    live-app MACD, scored with the same bucket logic for consistency."""
-    if len(closes) < 26:
-        return None
-    ema12 = closes.ewm(span=12).mean()
-    ema26 = closes.ewm(span=26).mean()
-    macd_line = ema12 - ema26
-    signal_line = macd_line.ewm(span=9).mean()
-    histogram = macd_line - signal_line
-    macd_val = float(macd_line.iloc[-1])
-    hist_val = float(histogram.iloc[-1])
-    if macd_val > 0 and hist_val > 0:
-        return 80.0
-    if macd_val > 0 and hist_val < 0:
-        return 55.0
-    if macd_val < 0 and hist_val > 0:
-        return 50.0
-    return 25.0
-
-
-def _bollinger_score(closes: pd.Series, period: int = 20, n_std: float = 2.0):
-    """%B position within a 20-day Bollinger Band: near the lower band is
-    read as oversold (bullish setup), near the upper band as overbought."""
-    if len(closes) < period:
-        return None
-    window = closes.iloc[-period:]
-    mid = float(window.mean())
-    std = float(window.std())
-    if std == 0:
-        return 55.0
-    upper = mid + n_std * std
-    lower = mid - n_std * std
-    price = float(closes.iloc[-1])
-    percent_b = (price - lower) / (upper - lower)
-    if percent_b <= 0.2:
-        return 75.0
-    if percent_b >= 0.8:
-        return 30.0
-    return 55.0
-
-
-def _sma_cross_score(closes: pd.Series):
-    """50D vs 200D moving-average cross, same bucket logic as the live
-    app's L6 Momentum (backend/layer6_momentum.py)."""
-    if len(closes) < 50:
-        return None
-    ma50 = float(closes.rolling(50).mean().iloc[-1])
-    price = float(closes.iloc[-1])
-    if len(closes) >= 200:
-        ma200 = float(closes.rolling(200).mean().iloc[-1])
-    else:
-        ma200 = float(closes.rolling(len(closes)).mean().iloc[-1])
-    if price > ma50 > ma200:
-        return 90.0
-    if price > ma50:
-        return 70.0
-    if price > ma200:
-        return 50.0
-    if ma50 > ma200:
-        return 30.0
-    return 15.0
-
-
-def _year_prices(daily_prices: pd.DataFrame, year: int) -> pd.DataFrame:
-    return daily_prices[daily_prices.index.year == year]
-
-
-def _price_on_or_before(daily_prices: pd.DataFrame, year: int, year_end: bool):
-    """Year-end (Dec) or year-start (Jan) close, using the nearest available
-    trading day -- a holiday/weekend boundary shouldn't drop the whole year."""
-    year_rows = _year_prices(daily_prices, year)
-    if year_rows.empty:
-        return None
-    return float(year_rows["Close"].iloc[-1]) if year_end else float(year_rows["Close"].iloc[0])
-
-
-# ---------------------------------------------------------------------------
-# Per-year PRISM score
-# ---------------------------------------------------------------------------
-
-def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
-    """Compute all 9 layers for a single fiscal year.
-
-    ticker_data = {
-        "ticker": str,
-        "daily_prices": DataFrame (full OHLCV history),
-        "fundamentals": dict from fetch_fundamentals_annual,
-        "dividends": Series from fetch_dividends,
-        "benchmark_prices": DataFrame OHLCV for the benchmark,
-        "is_crypto": bool,
-    }
-    """
-    daily_prices = ticker_data["daily_prices"]
-    fundamentals = ticker_data.get("fundamentals") or {}
-    dividends = ticker_data.get("dividends")
-    benchmark_prices = ticker_data.get("benchmark_prices")
-    is_crypto = ticker_data.get("is_crypto", False)
-
-    fy = fundamentals.get(year, {}) if not is_crypto else {}
-    prev_fy = fundamentals.get(year - 1, {}) if not is_crypto else {}
-
-    price_history_to_date = daily_prices[daily_prices.index.year <= year]
-    year_end_price = _price_on_or_before(daily_prices, year, year_end=True)
-    year_start_price = _price_on_or_before(daily_prices, year, year_end=False)
-
-    layers = {}
-
-    if not is_crypto:
-        # --- L1 Valuation ---
-        shares = fy.get("shares_outstanding")
-        net_income = fy.get("net_income")
-        eps = (net_income / shares) if (net_income is not None and shares) else None
-        pe = (year_end_price / eps) if (eps and eps > 0 and year_end_price) else None
-
-        equity = fy.get("total_equity")
-        bvps = (equity / shares) if (equity is not None and shares) else None
-        pb = (year_end_price / bvps) if (bvps and bvps > 0 and year_end_price) else None
-
-        market_cap = (year_end_price * shares) if (year_end_price and shares) else None
-        ebitda = fy.get("ebitda")
-        ev = (market_cap + (fy.get("total_debt") or 0) - (fy.get("cash") or 0)) if market_cap is not None else None
-        ev_ebitda = (ev / ebitda) if (ev is not None and ebitda and ebitda > 0) else None
-
-        revenue_for_ps = fy.get("revenue")
-        ps = (market_cap / revenue_for_ps) if (market_cap is not None and revenue_for_ps and revenue_for_ps > 0) else None
-
-        # Graham Number: sqrt(22.5 x EPS x BVPS), the classic Graham & Dodd
-        # fair-value estimate. Price well below it scores as cheap.
-        graham_score = None
-        if eps and eps > 0 and bvps and bvps > 0 and year_end_price:
-            graham_number = (22.5 * eps * bvps) ** 0.5
-            graham_score = _linear_score(year_end_price / graham_number, good=0.85, bad=1.15, higher_is_better=False)
-
-        # Simplified DCF: treat operating cash flow as a FCF stand-in (no
-        # capex data available), grow it one more year, discount the
-        # perpetuity at WACC - terminal growth (Gordon growth model), and
-        # compare the implied per-share value to the actual price.
-        dcf_score = None
-        op_cf_for_dcf = fy.get("operating_cashflow")
-        if op_cf_for_dcf and op_cf_for_dcf > 0 and shares and year_end_price:
-            fcf_per_share = op_cf_for_dcf / shares
-            intrinsic_value = fcf_per_share * (1 + _DCF_TERMINAL_GROWTH) / (_DCF_WACC - _DCF_TERMINAL_GROWTH)
-            if intrinsic_value > 0:
-                dcf_score = _linear_score(year_end_price / intrinsic_value, good=0.85, bad=1.15, higher_is_better=False)
-
-        layers["L1_valuation"] = _weighted_average([
-            (_linear_score(pe, good=15, bad=50, higher_is_better=False), 0.20),
-            (_linear_score(ev_ebitda, good=8, bad=25, higher_is_better=False), 0.20),
-            (graham_score, 0.20),
-            (dcf_score, 0.20),
-            (_linear_score(pb, good=1.5, bad=5, higher_is_better=False), 0.10),
-            (_linear_score(ps, good=2, bad=8, higher_is_better=False), 0.10),
-        ])
-
-        # --- L2 Profitability ---
-        revenue = fy.get("revenue")
-        margin = (net_income / revenue) if (net_income is not None and revenue) else None
-        roe = (net_income / equity) if (net_income is not None and equity) else None
-        assets = fy.get("total_assets")
-        roa = (net_income / assets) if (net_income is not None and assets) else None
-
-        cogs_for_margin = fy.get("cost_of_revenue")
-        gross_margin = ((revenue - cogs_for_margin) / revenue) if (revenue and cogs_for_margin is not None and revenue > 0) else None
-
-        ebit_for_roce = fy.get("ebit")
-        current_liab_for_roce = fy.get("current_liabilities")
-        capital_employed = (assets - current_liab_for_roce) if (assets is not None and current_liab_for_roce is not None) else None
-        roce = (ebit_for_roce / capital_employed) if (ebit_for_roce is not None and capital_employed and capital_employed > 0) else None
-
-        layers["L2_profitability"] = _weighted_average([
-            (None if roe is None else max(0.0, min(1.0, roe / 0.25)) * 100, 0.25),
-            (_linear_score(roce, good=0.20, bad=0.0, higher_is_better=True), 0.25),
-            (None if roa is None else max(0.0, min(1.0, roa / 0.12)) * 100, 0.20),
-            (None if margin is None else max(0.0, min(1.0, margin / 0.20)) * 100, 0.20),
-            (None if gross_margin is None else max(0.0, min(1.0, gross_margin / 0.40)) * 100, 0.10),
-        ])
-
-        # --- L3 Growth ---
-        prev_revenue = prev_fy.get("revenue")
-        rev_growth = ((revenue - prev_revenue) / abs(prev_revenue)) if (revenue is not None and prev_revenue) else None
-
-        prev_net_income = prev_fy.get("net_income")
-        prev_shares = prev_fy.get("shares_outstanding")
-        prev_eps = (prev_net_income / prev_shares) if (prev_net_income is not None and prev_shares) else None
-        eps_growth = ((eps - prev_eps) / abs(prev_eps)) if (eps is not None and prev_eps) else None
-
-        # Revenue CAGR over the earliest year available within a 5-year
-        # lookback -- yfinance's free annual statements only go back ~4
-        # years, so this naturally degrades to a 1-year (N=1) CAGR, which is
-        # mathematically identical to plain YoY growth, whenever that's all
-        # there is: (rev_t / rev_t-1)^(1/1) - 1 == rev_t/rev_t-1 - 1.
-        cagr = None
-        if revenue is not None and revenue > 0:
-            for n_back in range(5, 0, -1):
-                base_revenue = fundamentals.get(year - n_back, {}).get("revenue")
-                if base_revenue and base_revenue > 0:
-                    cagr = (revenue / base_revenue) ** (1 / n_back) - 1
-                    break
-
-        layers["L3_growth"] = _weighted_average([
-            (_linear_score(eps_growth, good=0.20, bad=-0.10, higher_is_better=True), 0.35),
-            (_linear_score(cagr, good=0.15, bad=-0.05, higher_is_better=True), 0.35),
-            (_linear_score(rev_growth, good=0.20, bad=-0.10, higher_is_better=True), 0.30),
-        ])
-
-        # --- L4 Safety ---
-        debt = fy.get("total_debt")
-        de_ratio = (debt / equity) if (debt is not None and equity) else None
-        current_assets = fy.get("current_assets")
-        current_liab = fy.get("current_liabilities")
-        current_ratio = (current_assets / current_liab) if (current_assets is not None and current_liab) else None
-        ebit = fy.get("ebit")
-        interest_expense = fy.get("interest_expense")
-        interest_coverage = (ebit / abs(interest_expense)) if (ebit is not None and interest_expense) else None
-
-        # Altman Z''-Score (emerging-markets variant, no X5 industry term) --
-        # same formula as backend/layer1_quality.py's live-app L1, reused
-        # here since it's already a proven, tested calculation.
-        altman_score = None
-        retained_earnings = fy.get("retained_earnings")
-        total_liabilities = fy.get("total_liabilities")
-        if (
-            assets and current_assets is not None and current_liab is not None
-            and retained_earnings is not None and ebit is not None
-            and total_liabilities and equity is not None
-        ):
-            working_capital = current_assets - current_liab
-            x1 = working_capital / assets
-            x2 = retained_earnings / assets
-            x3 = ebit / assets
-            x4 = equity / total_liabilities
-            altman_z = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4
-            if altman_z >= 2.6:
-                altman_score = 100.0
-            elif altman_z >= 1.1:
-                altman_score = 50.0
-            else:
-                altman_score = 0.0
-
-        layers["L4_safety"] = _weighted_average([
-            (altman_score, 0.35),
-            (_linear_score(interest_coverage, good=10, bad=1, higher_is_better=True), 0.25),
-            (_linear_score(de_ratio, good=0, bad=2.0, higher_is_better=False), 0.25),
-            (_linear_score(current_ratio, good=2.5, bad=0.5, higher_is_better=True), 0.15),
-        ])
-
-        # --- L5 Efficiency ---
-        asset_turnover = (revenue / assets) if (revenue is not None and assets) else None
-        cogs = fy.get("cost_of_revenue")
-        inventory = fy.get("inventory")
-        inventory_turnover = (cogs / inventory) if (cogs is not None and inventory) else None
-        op_cf = fy.get("operating_cashflow")
-        ocf_ni = (op_cf / net_income) if (op_cf is not None and net_income and net_income > 0) else None
-
-        accounts_receivable = fy.get("accounts_receivable")
-        receivables_days = (accounts_receivable / revenue * 365) if (accounts_receivable is not None and revenue and revenue > 0) else None
-
-        layers["L5_efficiency"] = _weighted_average([
-            (_linear_score(ocf_ni, good=1.5, bad=0, higher_is_better=True), 0.30),
-            (None if asset_turnover is None else max(0.0, min(1.0, asset_turnover / 1.0)) * 100, 0.30),
-            (_linear_score(receivables_days, good=30, bad=90, higher_is_better=False), 0.25),
-            (None if inventory_turnover is None else max(0.0, min(1.0, inventory_turnover / 8.0)) * 100, 0.15),
-        ])
-
-        # --- L6 Dividends ---
-        annual_dividend = None
-        if dividends is not None and not dividends.empty:
-            year_divs = dividends[dividends.index.year == year]
-            annual_dividend = float(year_divs.sum()) if not year_divs.empty else 0.0
-        div_yield = (annual_dividend / year_end_price) if (annual_dividend and year_end_price) else None
-        payout_ratio = (annual_dividend / eps) if (annual_dividend and eps and eps > 0) else None
-
-        if not annual_dividend:
-            layers["L6_dividends"] = 40.0
-        else:
-            yield_score = max(0.0, min(1.0, (div_yield or 0) / 0.04)) * 100
-            if payout_ratio is None:
-                payout_score = None
-            elif 0.20 <= payout_ratio <= 0.50:
-                payout_score = 100.0
-            elif payout_ratio > 0.80:
-                payout_score = 20.0
-            else:
-                payout_score = 70.0
-
-            dps_growth_score = None
-            if dividends is not None and not dividends.empty:
-                prev_year_divs = dividends[dividends.index.year == year - 1]
-                prev_annual_dividend = float(prev_year_divs.sum()) if not prev_year_divs.empty else None
-                if prev_annual_dividend:
-                    dps_growth = (annual_dividend - prev_annual_dividend) / abs(prev_annual_dividend)
-                    dps_growth_score = _linear_score(dps_growth, good=0.10, bad=-0.20, higher_is_better=True)
-
-            layers["L6_dividends"] = _weighted_average([
-                (yield_score, 0.40),
-                (payout_score, 0.35),
-                (dps_growth_score, 0.25),
-            ])
-    else:
-        layers.update({k: None for k in ["L1_valuation", "L2_profitability", "L3_growth", "L4_safety", "L5_efficiency", "L6_dividends"]})
-
-    # --- L7 Momentum (price-based, works for crypto too) ---
-    price_return = ((year_end_price / year_start_price) - 1) if (year_end_price and year_start_price) else None
-    closes_to_date = price_history_to_date["Close"] if not price_history_to_date.empty else pd.Series(dtype=float)
-
-    rsi_val = _rsi(closes_to_date)
-    rsi_score = None
-    if rsi_val is not None:
-        if rsi_val > 70 or rsi_val < 30:
-            rsi_score = max(0.0, 100 - abs(rsi_val - 55) * 2)
-        else:
-            rsi_score = 100 - abs(rsi_val - 55) * 1.2
-
-    layers["L7_momentum"] = _weighted_average([
-        (_linear_score(price_return, good=0.30, bad=-0.20, higher_is_better=True), 0.25),
-        (_sma_cross_score(closes_to_date), 0.20),
-        (rsi_score, 0.20),
-        (_macd_score(closes_to_date), 0.20),
-        (_bollinger_score(closes_to_date), 0.15),
-    ])
-
-    # --- L8 ESG ---
-    esg_score = ticker_data.get("esg_score")
-    layers["L8_esg"] = 50.0 if esg_score is None else esg_score
-
-    # --- L9 Relative Strength ---
-    rel_score = None
-    if benchmark_prices is not None and not benchmark_prices.empty and year_start_price and year_end_price:
-        bench_year = _year_prices(benchmark_prices, year)
-        if not bench_year.empty:
-            bench_start = float(bench_year["Close"].iloc[0])
-            bench_end = float(bench_year["Close"].iloc[-1])
-            if bench_start:
-                ticker_ret = (year_end_price / year_start_price) - 1
-                bench_ret = (bench_end / bench_start) - 1
-                outperformance = (ticker_ret - bench_ret) * 100  # percentage points
-                rel_score = _linear_score(outperformance, good=20, bad=-20, higher_is_better=True)
-    layers["L9_relative_strength"] = rel_score
-
-    # --- Weighted composite, renormalized over whatever is available ---
-    weights = NO_FUNDAMENTALS_WEIGHTS if is_crypto else LAYER_WEIGHTS
-    available = {k: v for k, v in layers.items() if v is not None and k in weights}
-    total_weight = sum(weights[k] for k in available)
-    score = sum(weights[k] * v for k, v in available.items()) / total_weight if total_weight else 50.0
-
-    n_layers = len([v for v in layers.values() if v is not None])
-    if n_layers >= 8:
-        data_quality = "full"
-    elif n_layers >= 4:
-        data_quality = "partial"
-    else:
-        data_quality = "minimal"
-
-    return {
-        "score": round(score, 1),
-        "signal": None,  # filled in by the caller once thresholds are known
-        "layers": layers,
-        "data_quality": data_quality,
-        "years_available": n_layers,
-    }
+def _cached_score_for_year(ticker: str, year: int) -> dict:
+    return compute_prism_score(ticker, year)
 
 
 def score_to_signal(score: float, buy_threshold: float, sell_threshold: float) -> str:
@@ -677,8 +89,6 @@ def run_backtest(
     sell_threshold: float,
     risk_free_when_out: bool = False,
 ) -> dict:
-    is_crypto = ticker.upper().endswith("-USD")
-
     daily_prices = fetch_stock_data(ticker, period_years)
     benchmark_prices = fetch_stock_data(benchmark, period_years)
 
@@ -686,44 +96,28 @@ def run_backtest(
     # (e.g. MSFT back to 1986 vs QQQ's 1999 inception, or a 10y lookback on
     # a ticker with only 3y of real history). Reindexing the benchmark onto
     # dates before it existed leaves leading NaNs with nothing to
-    # forward-fill from, which poisons every benchmark stat (total return,
-    # CAGR, Sharpe all come back NaN). Clip to the actual overlap instead --
-    # this also means the benchmark's own stats are computed over the same
-    # window as whatever ticker it's being compared against, not blindly
-    # reindexed onto a window it didn't trade through.
+    # forward-fill from, which poisons every benchmark stat. Clip to the
+    # actual overlap instead.
     common_start = max(daily_prices.index[0], benchmark_prices.index[0])
     common_end = min(daily_prices.index[-1], benchmark_prices.index[-1])
     if common_start >= common_end:
-        raise ValueError(
-            f"'{ticker}' and benchmark '{benchmark}' have no overlapping price history."
-        )
+        raise ValueError(f"'{ticker}' and benchmark '{benchmark}' have no overlapping price history.")
     daily_prices = daily_prices[(daily_prices.index >= common_start) & (daily_prices.index <= common_end)]
-
-    fundamentals = {} if is_crypto else fetch_fundamentals_annual(ticker)
-    dividends = pd.Series(dtype=float) if is_crypto else fetch_dividends(ticker)
-    esg_score = None if is_crypto else fetch_sustainability_score(ticker)
 
     start_year = int(daily_prices.index[0].year)
     end_year = int(daily_prices.index[-1].year)
-    macro = fetch_macro_data(start_year, end_year)
-
-    ticker_data = {
-        "ticker": ticker,
-        "daily_prices": daily_prices,
-        "fundamentals": fundamentals,
-        "dividends": dividends,
-        "benchmark_prices": benchmark_prices,
-        "esg_score": esg_score,
-        "is_crypto": is_crypto,
-    }
 
     rows = []
     for year in range(start_year, end_year + 1):
-        result = compute_prism_score(ticker_data, year, macro.get(year, {}))
-        result["signal"] = score_to_signal(result["score"], buy_threshold, sell_threshold)
-        row = {"year": year, "score": result["score"], "signal": result["signal"],
-               "data_quality": result["data_quality"], "years_available": result["years_available"]}
-        row.update(result["layers"])
+        result = _cached_score_for_year(ticker, year)
+        score = result["prism_score"]
+        signal = score_to_signal(score, buy_threshold, sell_threshold)
+        row = {
+            "year": year, "score": score, "signal": signal,
+            "data_quality": "full" if result["available_layers"] >= 7 else ("partial" if result["available_layers"] >= 4 else "minimal"),
+            "years_available": result["available_layers"],
+        }
+        row.update(result["sub_scores"])
         rows.append(row)
     scores_df = pd.DataFrame(rows).set_index("year")
 
@@ -732,7 +126,6 @@ def run_backtest(
     trade_log = []
     invested = False
     entry_price = None
-    entry_date = None
 
     for date in rebal_dates:
         year = date.year
@@ -745,14 +138,12 @@ def run_backtest(
         if signal == "BUY" and not invested:
             invested = True
             entry_price = price_at_date
-            entry_date = date
             trade_log.append({"date": date, "action": "BUY", "price": price_at_date, "score": score})
         elif signal == "SELL" and invested:
             pnl_pct = (price_at_date / entry_price - 1) * 100
             trade_log.append({"date": date, "action": "SELL", "price": price_at_date, "score": score, "pnl_pct": pnl_pct})
             invested = False
             entry_price = None
-            entry_date = None
 
     # --- Equity curves ---
     idx = daily_prices.index
@@ -763,7 +154,7 @@ def run_backtest(
     entry_equity = None
     trade_iter = iter(trade_log)
     next_trade = next(trade_iter, None)
-    risk_free_daily = (macro.get(start_year, {}).get("risk_free_rate", DEFAULT_RISK_FREE_RATE)) / 252
+    risk_free_daily = DEFAULT_RISK_FREE_RATE / 252
 
     for date in idx:
         while next_trade is not None and next_trade["date"] <= date:
@@ -794,15 +185,9 @@ def run_backtest(
     stats = compute_stats(equity, benchmark_curve, trade_log)
 
     return {
-        "scores": scores_df,
-        "daily_prices": daily_prices,
-        "benchmark_prices": benchmark_prices,
-        "trade_log": trade_log,
-        "equity_curve": equity,
-        "benchmark_curve": benchmark_curve,
-        "stats": stats,
-        "ticker": ticker,
-        "benchmark": benchmark,
+        "scores": scores_df, "daily_prices": daily_prices, "benchmark_prices": benchmark_prices,
+        "trade_log": trade_log, "equity_curve": equity, "benchmark_curve": benchmark_curve,
+        "stats": stats, "ticker": ticker, "benchmark": benchmark,
     }
 
 

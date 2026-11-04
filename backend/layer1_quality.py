@@ -1,122 +1,47 @@
 """
 Layer 1 (S1): Fundamental Quality.
 
-Combines three independent accounting-quality signals into a single 0-100 score:
-  - Altman Z'' Score (emerging-markets variant) — bankruptcy / distress risk
-  - Piotroski F-Score — fundamental strength trend (9 binary signals)
-  - Beneish M-Score — earnings-manipulation risk
+Combines four independent accounting-quality signals into a single 0-100
+score:
+  - Altman Z'' Score (emerging-markets variant) -- bankruptcy/distress risk
+  - Piotroski F-Score -- fundamental strength trend (9 binary signals)
+  - Beneish M-Score -- earnings-manipulation risk
+  - DPS Growth -- dividend-per-share trend, a shareholder-friendliness signal
+
+Works for both the live Analyze page (year=None -> latest available fiscal
+year) and the Backtest engine (an explicit historical year), since both now
+read from the same year-indexed fundamentals dict (fetch_fundamentals_annual)
+instead of always reading column 0 of a fresh yfinance DataFrame.
 
 Any sub-score that cannot be computed because of missing data is dropped and
-the remaining weights are renormalized to sum to 1.0 (see calculate_quality_score).
+the remaining weights are renormalized to sum to 1.0.
 """
 
-import pandas as pd
-
-from .data_fetcher import fetch_stock_data, get_financial_item
-
-# ---------------------------------------------------------------------------
-# Row-label keyword groups (yfinance naming varies by stock/region/version).
-# ---------------------------------------------------------------------------
-_KW_TOTAL_ASSETS = ["Total Assets"]
-_KW_CURRENT_ASSETS = ["Total Current Assets", "Current Assets"]
-_KW_CURRENT_LIABILITIES = ["Total Current Liabilities", "Current Liabilities"]
-_KW_RETAINED_EARNINGS = ["Retained Earnings"]
-_KW_TOTAL_LIABILITIES = ["Total Liabilities Net Minority Interest", "Total Liabilities", "Total Liab"]
-_KW_BOOK_EQUITY = [
-    "Total Equity Gross Minority Interest",
-    "Stockholders Equity",
-    "Total Stockholder Equity",
-    "Common Stock Equity",
-]
-_KW_LONG_TERM_DEBT = ["Long Term Debt", "LongTermDebt"]
-_KW_NET_RECEIVABLES = ["Net Receivables", "Accounts Receivable", "Receivables"]
-_KW_NET_PPE = ["Net PPE", "Property Plant Equipment Net", "Properties Plant And Equipment Net"]
-_KW_SHARES_OUTSTANDING = ["Ordinary Shares Number", "Share Issued", "Common Stock Shares Outstanding"]
-
-_KW_EBIT = ["EBIT"]
-_KW_OPERATING_INCOME = ["Operating Income"]
-_KW_NET_INCOME = ["Net Income Common Stockholders", "Net Income"]
-_KW_TOTAL_REVENUE = ["Total Revenue", "Operating Revenue"]
-_KW_COST_OF_REVENUE = ["Cost Of Revenue", "Reconciled Cost Of Revenue"]
-
-_KW_OPERATING_CASH_FLOW = [
-    "Operating Cash Flow",
-    "Total Cash From Operating Activities",
-    "Cash Flow From Continuing Operating Activities",
-]
-_KW_DEPRECIATION = ["Depreciation And Amortization", "Depreciation Amortization Depletion", "Depreciation"]
+from .data_fetcher import fetch_fundamentals_annual, fetch_dividends, _linear_score
 
 
-# ---------------------------------------------------------------------------
-# Lookup helpers. get_financial_item() (from data_fetcher) is used for every
-# current-period (t) value, per spec. These local helpers reuse the exact
-# same row-matching rule to additionally pull the prior-period (t-1) value,
-# which get_financial_item does not expose.
-# ---------------------------------------------------------------------------
-def _get_row_values(df, keywords):
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-    normalized_keywords = [kw.lower().replace(" ", "") for kw in keywords]
-    for row_label in df.index:
-        row_norm = str(row_label).lower().replace(" ", "")
-        for kw in normalized_keywords:
-            if kw in row_norm or row_norm in kw:
-                values = df.loc[row_label].dropna()
-                if values.empty:
-                    continue
-                return values
-    return None
-
-
-def _prior(df, keywords):
-    """Value from the period immediately before the most recent one (t-1)."""
-    values = _get_row_values(df, keywords)
-    if values is None or len(values) < 2:
-        return None
-    try:
-        return float(values.iloc[1])
-    except (TypeError, ValueError):
-        return None
-
-
-def _lookup_current(df, *keyword_groups):
-    for keywords in keyword_groups:
-        value = get_financial_item(df, keywords)
-        if value is not None:
-            return value
-    return None
-
-
-def _lookup_prior(df, *keyword_groups):
-    for keywords in keyword_groups:
-        value = _prior(df, keywords)
-        if value is not None:
-            return value
-    return None
+def _year_fy(fundamentals: dict, year):
+    if year is None:
+        if not fundamentals:
+            return {}, {}, None
+        year = max(fundamentals.keys())
+    return fundamentals.get(year, {}), fundamentals.get(year - 1, {}), year
 
 
 # ---------------------------------------------------------------------------
 # 1. Altman Z'' Score (emerging markets variant, no X5 industry term)
 # ---------------------------------------------------------------------------
-def _compute_altman_z(bs, fin):
-    total_assets = get_financial_item(bs, _KW_TOTAL_ASSETS)
-    current_assets = get_financial_item(bs, _KW_CURRENT_ASSETS)
-    current_liabilities = get_financial_item(bs, _KW_CURRENT_LIABILITIES)
-    retained_earnings = get_financial_item(bs, _KW_RETAINED_EARNINGS)
-    ebit = _lookup_current(fin, _KW_EBIT, _KW_OPERATING_INCOME)
-    total_liabilities = get_financial_item(bs, _KW_TOTAL_LIABILITIES)
-    book_equity = get_financial_item(bs, _KW_BOOK_EQUITY)
+def _compute_altman_z(fy):
+    total_assets = fy.get("total_assets")
+    current_assets = fy.get("current_assets")
+    current_liabilities = fy.get("current_liabilities")
+    retained_earnings = fy.get("retained_earnings")
+    ebit = fy.get("ebit")
+    total_liabilities = fy.get("total_liabilities")
+    book_equity = fy.get("total_equity")
 
-    required = [
-        total_assets,
-        current_assets,
-        current_liabilities,
-        retained_earnings,
-        ebit,
-        total_liabilities,
-        book_equity,
-    ]
-    if any(v is None for v in required) or total_assets == 0 or total_liabilities == 0:
+    required = [total_assets, current_assets, current_liabilities, retained_earnings, ebit, total_liabilities, book_equity]
+    if any(v is None for v in required) or not total_assets or not total_liabilities:
         return None, {}
 
     working_capital = current_assets - current_liabilities
@@ -124,22 +49,13 @@ def _compute_altman_z(bs, fin):
     x2 = retained_earnings / total_assets
     x3 = ebit / total_assets
     x4 = book_equity / total_liabilities
-
     z = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4
 
     raw = {
-        "total_assets": total_assets,
-        "current_assets": current_assets,
-        "current_liabilities": current_liabilities,
-        "working_capital": working_capital,
-        "retained_earnings": retained_earnings,
-        "ebit": ebit,
-        "total_liabilities": total_liabilities,
-        "book_equity": book_equity,
-        "x1_working_capital_to_assets": x1,
-        "x2_retained_earnings_to_assets": x2,
-        "x3_ebit_to_assets": x3,
-        "x4_equity_to_liabilities": x4,
+        "working_capital": working_capital, "retained_earnings": retained_earnings, "ebit": ebit,
+        "total_liabilities": total_liabilities, "book_equity": book_equity,
+        "x1_working_capital_to_assets": x1, "x2_retained_earnings_to_assets": x2,
+        "x3_ebit_to_assets": x3, "x4_equity_to_liabilities": x4,
     }
     return z, raw
 
@@ -147,44 +63,27 @@ def _compute_altman_z(bs, fin):
 # ---------------------------------------------------------------------------
 # 2. Piotroski F-Score (9 binary signals)
 # ---------------------------------------------------------------------------
-def _compute_piotroski_f(bs, fin, cf):
-    ta_t = get_financial_item(bs, _KW_TOTAL_ASSETS)
-    ta_p = _prior(bs, _KW_TOTAL_ASSETS)
-    ni_t = get_financial_item(fin, _KW_NET_INCOME)
-    ni_p = _prior(fin, _KW_NET_INCOME)
-    cfo_t = get_financial_item(cf, _KW_OPERATING_CASH_FLOW)
-    ltd_t = get_financial_item(bs, _KW_LONG_TERM_DEBT)
-    ltd_p = _prior(bs, _KW_LONG_TERM_DEBT)
-    ca_t = get_financial_item(bs, _KW_CURRENT_ASSETS)
-    ca_p = _prior(bs, _KW_CURRENT_ASSETS)
-    cl_t = get_financial_item(bs, _KW_CURRENT_LIABILITIES)
-    cl_p = _prior(bs, _KW_CURRENT_LIABILITIES)
-    shares_t = get_financial_item(bs, _KW_SHARES_OUTSTANDING)
-    shares_p = _prior(bs, _KW_SHARES_OUTSTANDING)
-    sales_t = get_financial_item(fin, _KW_TOTAL_REVENUE)
-    sales_p = _prior(fin, _KW_TOTAL_REVENUE)
-    cogs_t = get_financial_item(fin, _KW_COST_OF_REVENUE)
-    cogs_p = _prior(fin, _KW_COST_OF_REVENUE)
+def _compute_piotroski_f(fy, prev_fy):
+    ta_t, ta_p = fy.get("total_assets"), prev_fy.get("total_assets")
+    ni_t, ni_p = fy.get("net_income"), prev_fy.get("net_income")
+    cfo_t = fy.get("operating_cashflow")
+    ltd_t, ltd_p = fy.get("long_term_debt"), prev_fy.get("long_term_debt")
+    ca_t, ca_p = fy.get("current_assets"), prev_fy.get("current_assets")
+    cl_t, cl_p = fy.get("current_liabilities"), prev_fy.get("current_liabilities")
+    shares_t, shares_p = fy.get("shares_outstanding"), prev_fy.get("shares_outstanding")
+    sales_t, sales_p = fy.get("revenue"), prev_fy.get("revenue")
+    cogs_t, cogs_p = fy.get("cost_of_revenue"), prev_fy.get("cost_of_revenue")
 
-    required = [
-        ta_t, ta_p, ni_t, ni_p, cfo_t, ltd_t, ltd_p, ca_t, ca_p, cl_t, cl_p,
-        shares_t, shares_p, sales_t, sales_p, cogs_t, cogs_p,
-    ]
-    if any(v is None for v in required):
-        return None, {}
-    if ta_t == 0 or ta_p == 0 or cl_t == 0 or cl_p == 0 or sales_t == 0 or sales_p == 0:
+    required = [ta_t, ta_p, ni_t, ni_p, cfo_t, ltd_t, ltd_p, ca_t, ca_p, cl_t, cl_p, shares_t, shares_p, sales_t, sales_p, cogs_t, cogs_p]
+    if any(v is None for v in required) or not ta_t or not ta_p or not cl_t or not cl_p or not sales_t or not sales_p:
         return None, {}
 
-    roa_t = ni_t / ta_t
-    roa_p = ni_p / ta_p
-    ltd_ratio_t = ltd_t / ta_t
-    ltd_ratio_p = ltd_p / ta_p
-    current_ratio_t = ca_t / cl_t
-    current_ratio_p = ca_p / cl_p
+    roa_t, roa_p = ni_t / ta_t, ni_p / ta_p
+    ltd_ratio_t, ltd_ratio_p = ltd_t / ta_t, ltd_p / ta_p
+    current_ratio_t, current_ratio_p = ca_t / cl_t, ca_p / cl_p
     gross_margin_t = (sales_t - cogs_t) / sales_t
     gross_margin_p = (sales_p - cogs_p) / sales_p
-    asset_turnover_t = sales_t / ta_t
-    asset_turnover_p = sales_p / ta_p
+    asset_turnover_t, asset_turnover_p = sales_t / ta_t, sales_p / ta_p
 
     signals = {
         "P1_roa_positive": roa_t > 0,
@@ -197,54 +96,25 @@ def _compute_piotroski_f(bs, fin, cf):
         "P8_delta_gross_margin_up": gross_margin_t > gross_margin_p,
         "P9_delta_asset_turnover_up": asset_turnover_t > asset_turnover_p,
     }
-
-    f = sum(1 for signal in signals.values() if signal)
-
-    raw = {
-        "roa_t": roa_t,
-        "roa_prior": roa_p,
-        "cfo_t": cfo_t,
-        "long_term_debt_ratio_t": ltd_ratio_t,
-        "long_term_debt_ratio_prior": ltd_ratio_p,
-        "current_ratio_t": current_ratio_t,
-        "current_ratio_prior": current_ratio_p,
-        "shares_outstanding_t": shares_t,
-        "shares_outstanding_prior": shares_p,
-        "gross_margin_t": gross_margin_t,
-        "gross_margin_prior": gross_margin_p,
-        "asset_turnover_t": asset_turnover_t,
-        "asset_turnover_prior": asset_turnover_p,
-        "signals": signals,
-    }
+    f = sum(1 for v in signals.values() if v)
+    raw = {"roa_t": roa_t, "roa_prior": roa_p, "cfo_t": cfo_t, "signals": signals}
     return f, raw
 
 
 # ---------------------------------------------------------------------------
 # 3. Beneish M-Score (5-variable model)
 # ---------------------------------------------------------------------------
-def _compute_beneish_m(bs, fin, cf):
-    recv_t = get_financial_item(bs, _KW_NET_RECEIVABLES)
-    recv_p = _prior(bs, _KW_NET_RECEIVABLES)
-    sales_t = get_financial_item(fin, _KW_TOTAL_REVENUE)
-    sales_p = _prior(fin, _KW_TOTAL_REVENUE)
-    cogs_t = get_financial_item(fin, _KW_COST_OF_REVENUE)
-    cogs_p = _prior(fin, _KW_COST_OF_REVENUE)
-    ca_t = get_financial_item(bs, _KW_CURRENT_ASSETS)
-    ca_p = _prior(bs, _KW_CURRENT_ASSETS)
-    ppe_t = get_financial_item(bs, _KW_NET_PPE)
-    ppe_p = _prior(bs, _KW_NET_PPE)
-    ta_t = get_financial_item(bs, _KW_TOTAL_ASSETS)
-    ta_p = _prior(bs, _KW_TOTAL_ASSETS)
-    dep_t = get_financial_item(cf, _KW_DEPRECIATION)
-    dep_p = _prior(cf, _KW_DEPRECIATION)
+def _compute_beneish_m(fy, prev_fy):
+    recv_t, recv_p = fy.get("accounts_receivable"), prev_fy.get("accounts_receivable")
+    sales_t, sales_p = fy.get("revenue"), prev_fy.get("revenue")
+    cogs_t, cogs_p = fy.get("cost_of_revenue"), prev_fy.get("cost_of_revenue")
+    ca_t, ca_p = fy.get("current_assets"), prev_fy.get("current_assets")
+    ppe_t, ppe_p = fy.get("net_ppe"), prev_fy.get("net_ppe")
+    ta_t, ta_p = fy.get("total_assets"), prev_fy.get("total_assets")
+    dep_t, dep_p = fy.get("depreciation"), prev_fy.get("depreciation")
 
-    required = [
-        recv_t, recv_p, sales_t, sales_p, cogs_t, cogs_p, ca_t, ca_p,
-        ppe_t, ppe_p, ta_t, ta_p, dep_t, dep_p,
-    ]
-    if any(v is None for v in required):
-        return None, {}
-    if sales_t == 0 or sales_p == 0 or ta_t == 0 or ta_p == 0:
+    required = [recv_t, recv_p, sales_t, sales_p, cogs_t, cogs_p, ca_t, ca_p, ppe_t, ppe_p, ta_t, ta_p, dep_t, dep_p]
+    if any(v is None for v in required) or not sales_t or not sales_p or not ta_t or not ta_p:
         return None, {}
 
     gm_t = (sales_t - cogs_t) / sales_t
@@ -256,7 +126,7 @@ def _compute_beneish_m(bs, fin, cf):
     aqi_p = 1 - (ca_p + ppe_p) / ta_p
     depi_denom_t = ppe_t + dep_t
     depi_denom_p = ppe_p + dep_p
-    if aqi_p == 0 or depi_denom_t == 0 or depi_denom_p == 0 or recv_p == 0 or dep_t == 0:
+    if aqi_p == 0 or depi_denom_t == 0 or depi_denom_p == 0 or not recv_p or not dep_t:
         return None, {}
 
     try:
@@ -269,17 +139,29 @@ def _compute_beneish_m(bs, fin, cf):
         return None, {}
 
     m = -6.065 + 0.823 * dsri + 0.906 * gmi + 0.593 * aqi + 0.717 * sgi + 0.107 * depi
+    return m, {"dsri": dsri, "gmi": gmi, "aqi": aqi, "sgi": sgi, "depi": depi}
 
-    raw = {
-        "dsri": dsri,
-        "gmi": gmi,
-        "aqi": aqi,
-        "sgi": sgi,
-        "depi": depi,
-        "gross_margin_t": gm_t,
-        "gross_margin_prior": gm_p,
-    }
-    return m, raw
+
+# ---------------------------------------------------------------------------
+# 4. DPS Growth (YoY)
+# ---------------------------------------------------------------------------
+def _compute_dps_growth_score(ticker, year):
+    try:
+        dividends = fetch_dividends(ticker)
+    except Exception:
+        return None
+    if dividends is None or dividends.empty or year is None:
+        return None
+    this_year_divs = dividends[dividends.index.year == year]
+    prev_year_divs = dividends[dividends.index.year == year - 1]
+    if this_year_divs.empty or prev_year_divs.empty:
+        return None
+    this_total = float(this_year_divs.sum())
+    prev_total = float(prev_year_divs.sum())
+    if not prev_total:
+        return None
+    dps_growth = (this_total - prev_total) / abs(prev_total)
+    return _linear_score(dps_growth, good=0.10, bad=-0.20, higher_is_better=True)
 
 
 # ---------------------------------------------------------------------------
@@ -316,57 +198,61 @@ def _map_beneish(m):
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
-def calculate_quality_score(ticker: str) -> dict:
-    """
-    Compute S1 (fundamental quality, 0-100) for a ticker from Altman Z'',
-    Piotroski F-Score, and Beneish M-Score, weighted 40/40/20.
+def calculate_quality_score(ticker: str, year: int | None = None) -> dict:
+    """Compute S1 (fundamental quality, 0-100) from Altman Z'' (35%),
+    Piotroski F-Score (35%), Beneish M-Score (15%), and DPS Growth (15%).
+
+    year=None (the live Analyze page's usage) scores the latest fiscal year
+    yfinance has fundamentals for. An explicit year (the Backtest engine's
+    usage) scores that historical fiscal year instead, from the same
+    fetch_fundamentals_annual() dict -- so both pages run the exact same
+    formula, just pointed at a different year.
 
     Any sub-score that can't be computed (missing data) is dropped and the
     remaining weights are renormalized to sum to 1.0.
     """
-    data = fetch_stock_data(ticker)
-    bs = data.get("balance_sheet")
-    fin = data.get("financials")
-    cf = data.get("cashflow")
+    fundamentals = fetch_fundamentals_annual(ticker)
+    fy, prev_fy, resolved_year = _year_fy(fundamentals, year)
 
-    altman_z, altman_raw = _compute_altman_z(bs, fin)
-    piotroski_f, piotroski_raw = _compute_piotroski_f(bs, fin, cf)
-    beneish_m, beneish_raw = _compute_beneish_m(bs, fin, cf)
+    altman_z, altman_raw = _compute_altman_z(fy)
+    piotroski_f, piotroski_raw = _compute_piotroski_f(fy, prev_fy)
+    beneish_m, beneish_raw = _compute_beneish_m(fy, prev_fy)
+    dps_growth_score = _compute_dps_growth_score(ticker, resolved_year)
 
     z_score = _map_altman(altman_z)
     f_score = _map_piotroski(piotroski_f)
     m_score = _map_beneish(beneish_m)
 
-    weighted = {"z": (0.40, z_score), "f": (0.40, f_score), "m": (0.20, m_score)}
+    weighted = {"z": (0.35, z_score), "f": (0.35, f_score), "m": (0.15, m_score), "dps_growth": (0.15, dps_growth_score)}
     available = {key: (weight, score) for key, (weight, score) in weighted.items() if score is not None}
 
-    computed_count = len(available)
-    if computed_count == 0:
-        s1 = 0.0
+    if not available:
+        # None (not 0.0) -- a ticker with zero computable sub-scores (e.g.
+        # crypto, which has no fundamentals at all) should drop out of the
+        # composite via the usual weight-renormalization, not drag the
+        # whole PRISM score down with an artificial failing grade.
+        s1 = None
         data_quality = "insufficient"
         weights_used = {}
     else:
         total_weight = sum(weight for weight, _ in available.values())
         s1 = sum((weight / total_weight) * score for weight, score in available.values())
         weights_used = {key: round(weight / total_weight, 4) for key, (weight, _) in available.items()}
-        data_quality = "full" if computed_count == 3 else "partial"
+        data_quality = "full" if len(available) == 4 else "partial"
 
     details = {
-        "altman": altman_raw,
-        "piotroski": piotroski_raw,
-        "beneish": beneish_raw,
-        "sub_scores_computed": sorted(available.keys()),
-        "weights_used": weights_used,
+        "altman": altman_raw, "piotroski": piotroski_raw, "beneish": beneish_raw,
+        "sub_scores_computed": sorted(available.keys()), "weights_used": weights_used,
+        "year": resolved_year,
     }
 
     return {
-        "S1": round(s1, 2),
+        "S1": round(s1, 2) if s1 is not None else None,
         "altman_z": round(altman_z, 4) if altman_z is not None else None,
         "piotroski_f": piotroski_f,
         "beneish_m": round(beneish_m, 4) if beneish_m is not None else None,
-        "z_score": z_score,
-        "f_score": f_score,
-        "m_score": m_score,
+        "dps_growth_score": dps_growth_score,
+        "z_score": z_score, "f_score": f_score, "m_score": m_score,
         "details": details,
         "data_quality": data_quality,
     }

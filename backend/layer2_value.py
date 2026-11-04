@@ -1,150 +1,101 @@
 """
 Layer 2 (S2): Value Creation.
 
-Scores a stock on whether it actually creates economic value: does its
-return on invested capital (ROIC) clear its cost of capital (WACC), and does
-it convert that into real free cash flow relative to its market price.
+Scores a stock on whether it actually creates economic value -- does its
+return on invested capital (ROIC) clear its cost of capital (WACC), convert
+that into real free cash flow relative to its market price, and do so
+efficiently (ROCE, Gross Margin, Receivables Days) and growingly (Revenue
+CAGR).
+
+Works for both the live Analyze page (year=None) and the Backtest engine
+(an explicit historical year) via the shared fetch_fundamentals_annual()
+dict; live mode additionally uses today's actual price/beta for WACC, while
+historical mode reconstructs both from price history up to that year-end.
 """
 
-from .data_fetcher import fetch_stock_data, get_financial_item
+from .data_fetcher import (
+    fetch_fundamentals_annual, fetch_price_history_long, get_benchmark_ticker,
+    slice_price_window, _linear_score, weighted_average,
+)
 
-_RF = 0.028  # Thai 10Y government bond yield
+_RF = 0.028  # Thai 10Y government bond yield (live-mode fallback)
 _ERP = 0.065  # Damodaran Thailand equity risk premium (emerging market)
 _DEFAULT_TAX_RATE = 0.20
-_ESTIMATED_WACC = 0.09  # industry median fallback
-
-_KW_EBIT = ["EBIT"]
-_KW_OPERATING_INCOME = ["Operating Income"]
-_KW_INCOME_TAX_EXPENSE = ["Tax Provision", "Income Tax Expense"]
-_KW_PRETAX_INCOME = ["Pretax Income", "Income Before Tax"]
-_KW_INTEREST_EXPENSE = ["Interest Expense"]
-_KW_TOTAL_EQUITY = [
-    "Total Equity Gross Minority Interest",
-    "Stockholders Equity",
-    "Total Stockholder Equity",
-    "Common Stock Equity",
-]
-_KW_SHORT_TERM_DEBT = ["Current Debt", "Short Term Debt"]
-# NOTE: "Short Long Term Debt" is deliberately excluded -- its normalized form
-# contains "longtermdebt" as a substring, which causes data_fetcher's fuzzy
-# matcher to collide with the "Long Term Debt" row and double-count debt.
-_KW_LONG_TERM_DEBT = ["Long Term Debt", "LongTermDebt"]
-_KW_CASH = ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", "Cash"]
-_KW_OPERATING_CASH_FLOW = [
-    "Operating Cash Flow",
-    "Total Cash From Operating Activities",
-    "Cash Flow From Continuing Operating Activities",
-]
-_KW_CAPEX = [
-    "Capital Expenditure",
-    "Capital Expenditures",
-    "Purchase Of PPE",
-    "Purchases Of Property Plant And Equipment",
-]
+_ESTIMATED_WACC = 0.09
 
 
-def _first_available(df, *keyword_groups):
-    for keywords in keyword_groups:
-        value = get_financial_item(df, keywords)
-        if value is not None:
-            return value
-    return None
+def _year_fy(fundamentals, year):
+    if year is None:
+        if not fundamentals:
+            return {}, {}, None
+        year = max(fundamentals.keys())
+    return fundamentals.get(year, {}), fundamentals.get(year - 1, {}), year
 
 
-def _compute_tax_rate(fin):
-    tax_expense = get_financial_item(fin, _KW_INCOME_TAX_EXPENSE)
-    pretax_income = get_financial_item(fin, _KW_PRETAX_INCOME)
-    if tax_expense is None or pretax_income is None or pretax_income == 0:
+def _compute_tax_rate(fy):
+    tax_expense = fy.get("tax_expense")
+    pretax_income = fy.get("pretax_income")
+    if tax_expense is None or not pretax_income:
         return _DEFAULT_TAX_RATE, False
-
     rate = tax_expense / pretax_income
     if rate < 0 or rate > 0.6:
         return _DEFAULT_TAX_RATE, False
     return rate, True
 
 
-def _compute_roic(bs, fin, tax_rate):
-    ebit = _first_available(fin, _KW_EBIT, _KW_OPERATING_INCOME)
-    total_equity = get_financial_item(bs, _KW_TOTAL_EQUITY)
-    cash = get_financial_item(bs, _KW_CASH)
-
+def _compute_roic(fy, tax_rate):
+    ebit = fy.get("ebit")
+    total_equity = fy.get("total_equity")
+    cash = fy.get("cash")
     if ebit is None or total_equity is None or cash is None:
         return None, {}
-
-    short_term_debt = get_financial_item(bs, _KW_SHORT_TERM_DEBT) or 0
-    long_term_debt = get_financial_item(bs, _KW_LONG_TERM_DEBT) or 0
-    total_debt = short_term_debt + long_term_debt
-
+    total_debt = (fy.get("short_term_debt") or 0) + (fy.get("long_term_debt") or 0)
     nopat = ebit * (1 - tax_rate)
     invested_capital = total_equity + total_debt - cash
-    if invested_capital == 0:
+    if not invested_capital:
         return None, {}
-
     roic = nopat / invested_capital
-    raw = {
-        "ebit": ebit,
-        "nopat": nopat,
-        "total_equity": total_equity,
-        "total_debt": total_debt,
-        "cash": cash,
-        "invested_capital": invested_capital,
-    }
-    return roic, raw
+    return roic, {"ebit": ebit, "nopat": nopat, "invested_capital": invested_capital}
 
 
-def _compute_wacc(bs, fin, info, tax_rate):
-    beta = info.get("beta")
-    if beta is None:
-        beta = 1.0
+def _historical_beta(ticker, price_history, year):
+    """Beta vs the stock's own benchmark, computed from daily returns up to
+    `year`'s year-end -- the historical analogue of info['beta'] (which has
+    no historical dimension, only a single live value)."""
+    try:
+        window = slice_price_window(price_history, year)
+        bench = fetch_price_history_long(get_benchmark_ticker(ticker))
+        bench_window = slice_price_window(bench, year)
+        if window.empty or bench_window.empty:
+            return 1.0
+        stock_ret = window["Close"].pct_change().dropna()
+        bench_ret = bench_window["Close"].pct_change().dropna()
+        aligned = stock_ret.align(bench_ret, join="inner")
+        if len(aligned[0]) < 20:
+            return 1.0
+        cov = aligned[0].cov(aligned[1])
+        var = aligned[1].var()
+        return float(cov / var) if var else 1.0
+    except Exception:
+        return 1.0
+
+
+def _compute_wacc(fy, tax_rate, beta, price, shares):
     ke = _RF + beta * _ERP
+    interest_expense = fy.get("interest_expense")
+    total_debt = (fy.get("short_term_debt") or 0) + (fy.get("long_term_debt") or 0)
+    market_cap = (price * shares) if (price and shares) else None
 
-    interest_expense = get_financial_item(fin, _KW_INTEREST_EXPENSE)
-    short_term_debt = get_financial_item(bs, _KW_SHORT_TERM_DEBT) or 0
-    long_term_debt = get_financial_item(bs, _KW_LONG_TERM_DEBT) or 0
-    total_debt = short_term_debt + long_term_debt
-    market_cap = info.get("marketCap")
-
-    if interest_expense is None or total_debt <= 0 or market_cap is None or market_cap <= 0:
-        # Not enough debt/interest data for a real WACC -- caller falls back
-        # to the industry median.
+    if interest_expense is None or total_debt <= 0 or not market_cap:
         return None, {"beta": beta, "ke": ke}, False
 
-    # abs() because yfinance reports Interest Expense as a negative outflow;
-    # Kd is a cost (rate), so it must come out positive.
     kd = abs(interest_expense) / total_debt
     kd_after_tax = kd * (1 - tax_rate)
-
     v = market_cap + total_debt
     we = market_cap / v
     wd = total_debt / v
     wacc = we * ke + wd * kd_after_tax
-
-    raw = {
-        "beta": beta,
-        "ke": ke,
-        "interest_expense": interest_expense,
-        "total_debt": total_debt,
-        "kd": kd,
-        "kd_after_tax": kd_after_tax,
-        "market_cap": market_cap,
-        "we": we,
-        "wd": wd,
-    }
-    return wacc, raw, True
-
-
-def _compute_fcf_yield(cf, info):
-    ocf = get_financial_item(cf, _KW_OPERATING_CASH_FLOW)
-    capex = get_financial_item(cf, _KW_CAPEX)
-    market_cap = info.get("marketCap")
-
-    if ocf is None or capex is None or market_cap is None or market_cap == 0:
-        return None, None, {}
-
-    fcf = ocf - capex
-    fcf_yield = fcf / market_cap
-    raw = {"ocf": ocf, "capex": capex, "fcf": fcf, "market_cap": market_cap}
-    return fcf, fcf_yield, raw
+    return wacc, {"beta": beta, "ke": ke, "kd": kd, "market_cap": market_cap}, True
 
 
 def _map_spread(spread):
@@ -173,59 +124,89 @@ def _map_fcf_yield(fcf_yield):
     return 0.0
 
 
-def calculate_value_score(ticker: str) -> dict:
+def calculate_value_score(ticker: str, year: int | None = None) -> dict:
+    """Compute S2 (value creation, 0-100): ROIC-WACC spread (30%), FCF
+    Yield (20%), ROCE (20%), Revenue CAGR (15%), Gross Margin (10%),
+    Receivables Days (5%).
+
+    year=None (live) uses today's actual price/shares for WACC's market cap
+    and the stock's live beta; an explicit year (Backtest) reconstructs both
+    from price history ending at that fiscal year, so the two modes run the
+    identical formula pointed at different points in time.
     """
-    Compute S2 (value creation, 0-100) for a ticker from the ROIC-WACC spread
-    (60%) and FCF yield (40%).
+    fundamentals = fetch_fundamentals_annual(ticker)
+    fy, prev_fy, resolved_year = _year_fy(fundamentals, year)
+    price_history = fetch_price_history_long(ticker)
 
-    If WACC can't be computed from debt/interest data, falls back to a
-    0.09 industry-median estimate and sets estimated_wacc=True. If one of
-    the two sub-scores is missing, the other alone determines S2.
-    """
-    data = fetch_stock_data(ticker)
-    bs = data.get("balance_sheet")
-    fin = data.get("financials")
-    cf = data.get("cashflow")
-    info = data.get("info") or {}
+    if year is None:
+        # Live: use today's actual price (last close) and a live-style beta
+        # (computed the same historical way, just "as of now" i.e. no cutoff).
+        price = float(price_history["Close"].iloc[-1]) if not price_history.empty else None
+        beta = _historical_beta(ticker, price_history, None)
+    else:
+        year_rows = price_history[price_history.index.year == year]
+        price = float(year_rows["Close"].iloc[-1]) if not year_rows.empty else None
+        beta = _historical_beta(ticker, price_history, year)
 
-    tax_rate, tax_rate_computed = _compute_tax_rate(fin)
+    shares = fy.get("shares_outstanding")
 
-    roic, roic_raw = _compute_roic(bs, fin, tax_rate)
-    wacc, wacc_raw, wacc_computed = _compute_wacc(bs, fin, info, tax_rate)
-
+    tax_rate, tax_rate_computed = _compute_tax_rate(fy)
+    roic, roic_raw = _compute_roic(fy, tax_rate)
+    wacc, wacc_raw, wacc_computed = _compute_wacc(fy, tax_rate, beta, price, shares)
     estimated_wacc = not wacc_computed
     if wacc is None:
         wacc = _ESTIMATED_WACC
 
-    spread = roic - wacc if roic is not None else None
+    spread = (roic - wacc) if roic is not None else None
 
-    fcf, fcf_yield, fcf_raw = _compute_fcf_yield(cf, info)
+    ocf = fy.get("operating_cashflow")
+    capex = fy.get("capex")
+    market_cap = (price * shares) if (price and shares) else None
+    # yfinance reports Capital Expenditure as a negative cash OUTFLOW, so
+    # FCF = OCF + capex (adding a negative correctly subtracts it) -- not
+    # OCF - capex, which would double-add it back. Confirmed by direct
+    # inspection: every ticker checked came back with capex < 0.
+    fcf = (ocf + capex) if (ocf is not None and capex is not None) else None
+    fcf_yield = (fcf / market_cap) if (fcf is not None and market_cap) else None
 
-    eva = None
-    if roic is not None and spread is not None and roic_raw.get("invested_capital") is not None:
-        eva = spread * roic_raw["invested_capital"]
+    revenue = fy.get("revenue")
+    assets = fy.get("total_assets")
+    current_liab = fy.get("current_liabilities")
+    ebit = fy.get("ebit")
+    capital_employed = (assets - current_liab) if (assets is not None and current_liab is not None) else None
+    roce = (ebit / capital_employed) if (ebit is not None and capital_employed and capital_employed > 0) else None
+
+    cogs = fy.get("cost_of_revenue")
+    gross_margin = ((revenue - cogs) / revenue) if (revenue and cogs is not None and revenue > 0) else None
+
+    cagr = None
+    if revenue and resolved_year is not None:
+        for n_back in range(5, 0, -1):
+            base_revenue = fundamentals.get(resolved_year - n_back, {}).get("revenue")
+            if base_revenue and base_revenue > 0:
+                cagr = (revenue / base_revenue) ** (1 / n_back) - 1
+                break
+
+    receivables = fy.get("accounts_receivable")
+    receivables_days = (receivables / revenue * 365) if (receivables is not None and revenue and revenue > 0) else None
 
     spread_score = _map_spread(spread)
     fcf_yield_score = _map_fcf_yield(fcf_yield)
+    roce_score = _linear_score(roce, good=0.20, bad=0.0, higher_is_better=True)
+    cagr_score = _linear_score(cagr, good=0.15, bad=-0.05, higher_is_better=True)
+    gross_margin_score = None if gross_margin is None else max(0.0, min(1.0, gross_margin / 0.40)) * 100
+    receivables_score = _linear_score(receivables_days, good=30, bad=90, higher_is_better=False)
 
-    weighted = {"spread": (0.60, spread_score), "fcf": (0.40, fcf_yield_score)}
-    available = {key: (weight, score) for key, (weight, score) in weighted.items() if score is not None}
-
-    if available:
-        total_weight = sum(weight for weight, _ in available.values())
-        s2 = sum((weight / total_weight) * score for weight, score in available.values())
-    else:
-        s2 = None
+    s2 = weighted_average([
+        (spread_score, 0.30), (fcf_yield_score, 0.20), (roce_score, 0.20),
+        (cagr_score, 0.15), (gross_margin_score, 0.10), (receivables_score, 0.05),
+    ])
 
     details = {
-        "roic": roic_raw,
-        "wacc": wacc_raw,
-        "fcf": fcf_raw,
-        "tax_rate": tax_rate,
-        "tax_rate_computed": tax_rate_computed,
-        "spread_score": spread_score,
-        "fcf_yield_score": fcf_yield_score,
-        "sub_scores_computed": sorted(available.keys()),
+        "roic": roic_raw, "wacc": wacc_raw, "tax_rate": tax_rate, "tax_rate_computed": tax_rate_computed,
+        "spread_score": spread_score, "fcf_yield_score": fcf_yield_score, "roce_score": roce_score,
+        "cagr_score": cagr_score, "gross_margin_score": gross_margin_score, "receivables_score": receivables_score,
+        "year": resolved_year,
     }
 
     return {
@@ -234,7 +215,10 @@ def calculate_value_score(ticker: str) -> dict:
         "wacc": round(wacc, 4) if wacc is not None else None,
         "spread": round(spread, 4) if spread is not None else None,
         "fcf_yield": round(fcf_yield, 4) if fcf_yield is not None else None,
-        "eva": round(eva, 2) if eva is not None else None,
+        "roce": round(roce, 4) if roce is not None else None,
+        "gross_margin": round(gross_margin, 4) if gross_margin is not None else None,
+        "revenue_cagr": round(cagr, 4) if cagr is not None else None,
+        "receivables_days": round(receivables_days, 1) if receivables_days is not None else None,
         "estimated_wacc": estimated_wacc,
         "details": details,
     }

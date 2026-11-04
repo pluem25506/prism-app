@@ -20,8 +20,15 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from backend.prism_score import WEIGHTS
 from frontend.ui_theme import inject_sidebar_nav_style
-from utils.prism_score import LAYER_WEIGHTS, run_backtest
+from utils.prism_score import LAYER_LABELS, run_backtest
+
+# S7 Portfolio Fit depends on the user's *current* holdings -- it has no
+# historical meaning, so backend.prism_score always returns it as None for
+# a historical year. Excluded from the backtest's own layer displays (it'd
+# just be a permanently-blank row/line otherwise).
+BACKTEST_LAYER_KEYS = [k for k in WEIGHTS if k != "S7"]
 
 st.set_page_config(page_title="PRISM Backtest Engine", layout="wide")
 inject_sidebar_nav_style()
@@ -218,7 +225,7 @@ else:
             fig2.add_vline(x=t["date"], line_dash="dash",
                             line_color=GREEN if t["action"] == "BUY" else RED, row=1, col=1)
 
-        layer_cols = list(LAYER_WEIGHTS.keys())
+        layer_cols = BACKTEST_LAYER_KEYS
         year_starts, bar_colors, bar_scores, hover_texts = [], [], [], []
         for year, row in scores_df.iterrows():
             year_rows = daily_prices[daily_prices.index.year == year]
@@ -261,7 +268,7 @@ else:
         st.plotly_chart(fig2, width="stretch")
 
     with tab3:
-        layer_cols = list(LAYER_WEIGHTS.keys())
+        layer_cols = BACKTEST_LAYER_KEYS
         bar_colors = [SIGNAL_COLORS[s] for s in scores_df["signal"]]
         hover_texts = []
         for year, row in scores_df.iterrows():
@@ -287,7 +294,7 @@ else:
         heat = go.Figure(data=go.Heatmap(
             z=scores_df[layer_cols].T.values,
             x=scores_df.index.astype(str),
-            y=layer_cols,
+            y=[f"{k} {LAYER_LABELS.get(k, '')}" for k in layer_cols],
             colorscale="RdYlGn", zmin=0, zmax=100,
             hovertemplate="Year %{x}<br>%{y}: %{z:.1f}<extra></extra>",
             colorbar=dict(title="Score"),

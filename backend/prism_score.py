@@ -28,45 +28,61 @@ WEIGHTS = {
     "S5": 0.10,  # L5 Monte Carlo
     "S6": 0.05,  # L6 Time-Series Momentum
     "S7": 0.05,  # L7 Portfolio Fit
-    "S8": 0.05,  # L8 Resp. AI / ESG
+    "S8": 0.05,  # L8 Operating & Financial Leverage
     "S9": 0.05,  # L9 Contextual Intel
 }
 
 STUBS = {}
 
 
-def _safe_call(fn, ticker):
+def _safe_call(fn, ticker, year=None):
     """Run a layer's compute function, degrading to an empty result on any failure."""
     try:
-        return fn(ticker)
+        return fn(ticker, year) if year is not None else fn(ticker)
     except Exception as exc:
         return {"error": str(exc)}
 
 
-def compute_prism_score(ticker: str) -> dict:
-    """Run all nine PRISM layers for a ticker and combine them into a single score."""
-    validate_ticker(ticker)
+def compute_prism_score(ticker: str, year: int | None = None) -> dict:
+    """Run all nine PRISM layers for a ticker and combine them into a single
+    score. year=None (the live Analyze page's usage) scores the latest
+    available data for every layer; an explicit year (the Backtest engine's
+    usage) scores that historical fiscal year instead, from the exact same
+    layer functions -- so both pages run the identical model, just pointed
+    at a different point in time. L7 Portfolio Fit is inherently about the
+    user's *current* holdings and has no historical analogue, so it's
+    always skipped (score=None, weight renormalized away) when year is given.
+    """
+    if year is None:
+        validate_ticker(ticker)
 
-    layer1_result = _safe_call(compute_layer1, ticker)
-    layer2_result = _safe_call(compute_layer2, ticker)
-    layer3_result = _safe_call(compute_layer3, ticker)
-    layer4_result = _safe_call(compute_layer4, ticker)
-    layer5_result = _safe_call(compute_layer5, ticker)
-    layer6_result = _safe_call(compute_layer6, ticker)
+    layer1_result = _safe_call(compute_layer1, ticker, year)
+    layer2_result = _safe_call(compute_layer2, ticker, year)
+    layer3_result = _safe_call(compute_layer3, ticker, year)
+    layer4_result = _safe_call(compute_layer4, ticker, year)
+    layer5_result = _safe_call(compute_layer5, ticker, year)
+    layer6_result = _safe_call(compute_layer6, ticker, year)
 
-    portfolio = st.session_state.get("portfolio", []) if hasattr(st, "session_state") else []
-    if portfolio:
-        try:
-            layer7_result = compute_layer7(ticker, portfolio)
-        except Exception as exc:
-            layer7_result = {"error": str(exc)}
+    if year is not None:
+        layer7_result = {"S7": None, "data_quality": "not_applicable",
+                          "details": ["Portfolio Fit depends on today's actual holdings -- not meaningful for a historical backtest"]}
     else:
-        layer7_result = {"S7": 50, "data_quality": "stub", "details": ["No portfolio set"]}
+        portfolio = st.session_state.get("portfolio", []) if hasattr(st, "session_state") else []
+        if portfolio:
+            try:
+                layer7_result = compute_layer7(ticker, portfolio)
+            except Exception as exc:
+                layer7_result = {"error": str(exc)}
+        else:
+            layer7_result = {"S7": 50, "data_quality": "stub", "details": ["No portfolio set"]}
 
-    layer8_result = _safe_call(compute_layer8, ticker)
+    layer8_result = _safe_call(compute_layer8, ticker, year)
 
     fred_key = st.secrets.get("FRED_API_KEY", "") if hasattr(st, "secrets") else ""
-    layer9_result = _safe_call(lambda t: compute_layer9(t, fred_key), ticker)
+    try:
+        layer9_result = compute_layer9(ticker, fred_key, year) if year is not None else compute_layer9(ticker, fred_key)
+    except Exception as exc:
+        layer9_result = {"error": str(exc)}
 
     computed = {
         "S1": layer1_result.get("S1"),

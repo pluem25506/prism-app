@@ -506,6 +506,23 @@ def run_backtest(
     daily_prices = fetch_stock_data(ticker, period_years)
     benchmark_prices = fetch_stock_data(benchmark, period_years)
 
+    # A target ticker's own history can predate the benchmark's existence
+    # (e.g. MSFT back to 1986 vs QQQ's 1999 inception, or a 10y lookback on
+    # a ticker with only 3y of real history). Reindexing the benchmark onto
+    # dates before it existed leaves leading NaNs with nothing to
+    # forward-fill from, which poisons every benchmark stat (total return,
+    # CAGR, Sharpe all come back NaN). Clip to the actual overlap instead --
+    # this also means the benchmark's own stats are computed over the same
+    # window as whatever ticker it's being compared against, not blindly
+    # reindexed onto a window it didn't trade through.
+    common_start = max(daily_prices.index[0], benchmark_prices.index[0])
+    common_end = min(daily_prices.index[-1], benchmark_prices.index[-1])
+    if common_start >= common_end:
+        raise ValueError(
+            f"'{ticker}' and benchmark '{benchmark}' have no overlapping price history."
+        )
+    daily_prices = daily_prices[(daily_prices.index >= common_start) & (daily_prices.index <= common_end)]
+
     fundamentals = {} if is_crypto else fetch_fundamentals_annual(ticker)
     dividends = pd.Series(dtype=float) if is_crypto else fetch_dividends(ticker)
     esg_score = None if is_crypto else fetch_sustainability_score(ticker)

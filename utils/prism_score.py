@@ -30,6 +30,14 @@ except ImportError:
 
 DEFAULT_RISK_FREE_RATE = 0.04
 
+# Simplified DCF assumptions (same style as backend/layer2_value.py's
+# industry-median WACC fallback): a 9% discount rate and a 2.5% terminal
+# growth rate, applied to operating cash flow as a stand-in for free cash
+# flow (capex isn't fetched, so this is FCF-light, not true unlevered FCF --
+# documented simplification, not an attempt at a precise DCF).
+_DCF_WACC = 0.09
+_DCF_TERMINAL_GROWTH = 0.025
+
 LAYER_WEIGHTS = {
     "L1_valuation": 0.15,
     "L2_profitability": 0.15,
@@ -121,6 +129,9 @@ def fetch_fundamentals_annual(ticker: str) -> dict:
         "current_liabilities": _item_row(balance_sheet, ["Total Current Liabilities", "Current Liabilities"]),
         "inventory": _item_row(balance_sheet, ["Inventory"]),
         "operating_cashflow": _item_row(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities", "Cash Flow From Continuing Operating Activities"]),
+        "retained_earnings": _item_row(balance_sheet, ["Retained Earnings"]),
+        "total_liabilities": _item_row(balance_sheet, ["Total Liabilities Net Minority Interest", "Total Liab"]),
+        "accounts_receivable": _item_row(balance_sheet, ["Receivables", "Accounts Receivable", "Net Receivables"]),
     }
 
     years = set()
@@ -234,6 +245,19 @@ def _average(scores):
     return float(np.mean(present)) if present else None
 
 
+def _weighted_average(pairs):
+    """pairs: [(score_or_None, weight), ...]. Missing scores are dropped and
+    the remaining weights renormalized, so a layer with some unavailable
+    sub-metrics still scores fairly on whatever it does have."""
+    present = [(score, weight) for score, weight in pairs if score is not None]
+    if not present:
+        return None
+    total_weight = sum(weight for _, weight in present)
+    if total_weight == 0:
+        return None
+    return float(sum(score * weight for score, weight in present) / total_weight)
+
+
 def _rsi(closes: pd.Series, period: int = 14):
     if len(closes) < period + 1:
         return None
@@ -246,6 +270,70 @@ def _rsi(closes: pd.Series, period: int = 14):
         return 100.0
     rs = avg_gain / avg_loss
     return float(100 - (100 / (1 + rs)))
+
+
+def _macd_score(closes: pd.Series):
+    """Same 12/26 EMA, 9-period signal line as backend/layer6_momentum.py's
+    live-app MACD, scored with the same bucket logic for consistency."""
+    if len(closes) < 26:
+        return None
+    ema12 = closes.ewm(span=12).mean()
+    ema26 = closes.ewm(span=26).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9).mean()
+    histogram = macd_line - signal_line
+    macd_val = float(macd_line.iloc[-1])
+    hist_val = float(histogram.iloc[-1])
+    if macd_val > 0 and hist_val > 0:
+        return 80.0
+    if macd_val > 0 and hist_val < 0:
+        return 55.0
+    if macd_val < 0 and hist_val > 0:
+        return 50.0
+    return 25.0
+
+
+def _bollinger_score(closes: pd.Series, period: int = 20, n_std: float = 2.0):
+    """%B position within a 20-day Bollinger Band: near the lower band is
+    read as oversold (bullish setup), near the upper band as overbought."""
+    if len(closes) < period:
+        return None
+    window = closes.iloc[-period:]
+    mid = float(window.mean())
+    std = float(window.std())
+    if std == 0:
+        return 55.0
+    upper = mid + n_std * std
+    lower = mid - n_std * std
+    price = float(closes.iloc[-1])
+    percent_b = (price - lower) / (upper - lower)
+    if percent_b <= 0.2:
+        return 75.0
+    if percent_b >= 0.8:
+        return 30.0
+    return 55.0
+
+
+def _sma_cross_score(closes: pd.Series):
+    """50D vs 200D moving-average cross, same bucket logic as the live
+    app's L6 Momentum (backend/layer6_momentum.py)."""
+    if len(closes) < 50:
+        return None
+    ma50 = float(closes.rolling(50).mean().iloc[-1])
+    price = float(closes.iloc[-1])
+    if len(closes) >= 200:
+        ma200 = float(closes.rolling(200).mean().iloc[-1])
+    else:
+        ma200 = float(closes.rolling(len(closes)).mean().iloc[-1])
+    if price > ma50 > ma200:
+        return 90.0
+    if price > ma50:
+        return 70.0
+    if price > ma200:
+        return 50.0
+    if ma50 > ma200:
+        return 30.0
+    return 15.0
 
 
 def _year_prices(daily_prices: pd.DataFrame, year: int) -> pd.DataFrame:
@@ -308,10 +396,35 @@ def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
         ev = (market_cap + (fy.get("total_debt") or 0) - (fy.get("cash") or 0)) if market_cap is not None else None
         ev_ebitda = (ev / ebitda) if (ev is not None and ebitda and ebitda > 0) else None
 
-        layers["L1_valuation"] = _average([
-            _linear_score(pe, good=15, bad=50, higher_is_better=False),
-            _linear_score(pb, good=1.5, bad=5, higher_is_better=False),
-            _linear_score(ev_ebitda, good=8, bad=25, higher_is_better=False),
+        revenue_for_ps = fy.get("revenue")
+        ps = (market_cap / revenue_for_ps) if (market_cap is not None and revenue_for_ps and revenue_for_ps > 0) else None
+
+        # Graham Number: sqrt(22.5 x EPS x BVPS), the classic Graham & Dodd
+        # fair-value estimate. Price well below it scores as cheap.
+        graham_score = None
+        if eps and eps > 0 and bvps and bvps > 0 and year_end_price:
+            graham_number = (22.5 * eps * bvps) ** 0.5
+            graham_score = _linear_score(year_end_price / graham_number, good=0.85, bad=1.15, higher_is_better=False)
+
+        # Simplified DCF: treat operating cash flow as a FCF stand-in (no
+        # capex data available), grow it one more year, discount the
+        # perpetuity at WACC - terminal growth (Gordon growth model), and
+        # compare the implied per-share value to the actual price.
+        dcf_score = None
+        op_cf_for_dcf = fy.get("operating_cashflow")
+        if op_cf_for_dcf and op_cf_for_dcf > 0 and shares and year_end_price:
+            fcf_per_share = op_cf_for_dcf / shares
+            intrinsic_value = fcf_per_share * (1 + _DCF_TERMINAL_GROWTH) / (_DCF_WACC - _DCF_TERMINAL_GROWTH)
+            if intrinsic_value > 0:
+                dcf_score = _linear_score(year_end_price / intrinsic_value, good=0.85, bad=1.15, higher_is_better=False)
+
+        layers["L1_valuation"] = _weighted_average([
+            (_linear_score(pe, good=15, bad=50, higher_is_better=False), 0.20),
+            (_linear_score(ev_ebitda, good=8, bad=25, higher_is_better=False), 0.20),
+            (graham_score, 0.20),
+            (dcf_score, 0.20),
+            (_linear_score(pb, good=1.5, bad=5, higher_is_better=False), 0.10),
+            (_linear_score(ps, good=2, bad=8, higher_is_better=False), 0.10),
         ])
 
         # --- L2 Profitability ---
@@ -321,10 +434,20 @@ def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
         assets = fy.get("total_assets")
         roa = (net_income / assets) if (net_income is not None and assets) else None
 
-        layers["L2_profitability"] = _average([
-            None if margin is None else max(0.0, min(1.0, margin / 0.20)) * 100,
-            None if roe is None else max(0.0, min(1.0, roe / 0.25)) * 100,
-            None if roa is None else max(0.0, min(1.0, roa / 0.12)) * 100,
+        cogs_for_margin = fy.get("cost_of_revenue")
+        gross_margin = ((revenue - cogs_for_margin) / revenue) if (revenue and cogs_for_margin is not None and revenue > 0) else None
+
+        ebit_for_roce = fy.get("ebit")
+        current_liab_for_roce = fy.get("current_liabilities")
+        capital_employed = (assets - current_liab_for_roce) if (assets is not None and current_liab_for_roce is not None) else None
+        roce = (ebit_for_roce / capital_employed) if (ebit_for_roce is not None and capital_employed and capital_employed > 0) else None
+
+        layers["L2_profitability"] = _weighted_average([
+            (None if roe is None else max(0.0, min(1.0, roe / 0.25)) * 100, 0.25),
+            (_linear_score(roce, good=0.20, bad=0.0, higher_is_better=True), 0.25),
+            (None if roa is None else max(0.0, min(1.0, roa / 0.12)) * 100, 0.20),
+            (None if margin is None else max(0.0, min(1.0, margin / 0.20)) * 100, 0.20),
+            (None if gross_margin is None else max(0.0, min(1.0, gross_margin / 0.40)) * 100, 0.10),
         ])
 
         # --- L3 Growth ---
@@ -336,9 +459,23 @@ def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
         prev_eps = (prev_net_income / prev_shares) if (prev_net_income is not None and prev_shares) else None
         eps_growth = ((eps - prev_eps) / abs(prev_eps)) if (eps is not None and prev_eps) else None
 
-        layers["L3_growth"] = _average([
-            _linear_score(rev_growth, good=0.20, bad=-0.10, higher_is_better=True),
-            _linear_score(eps_growth, good=0.20, bad=-0.10, higher_is_better=True),
+        # Revenue CAGR over the earliest year available within a 5-year
+        # lookback -- yfinance's free annual statements only go back ~4
+        # years, so this naturally degrades to a 1-year (N=1) CAGR, which is
+        # mathematically identical to plain YoY growth, whenever that's all
+        # there is: (rev_t / rev_t-1)^(1/1) - 1 == rev_t/rev_t-1 - 1.
+        cagr = None
+        if revenue is not None and revenue > 0:
+            for n_back in range(5, 0, -1):
+                base_revenue = fundamentals.get(year - n_back, {}).get("revenue")
+                if base_revenue and base_revenue > 0:
+                    cagr = (revenue / base_revenue) ** (1 / n_back) - 1
+                    break
+
+        layers["L3_growth"] = _weighted_average([
+            (_linear_score(eps_growth, good=0.20, bad=-0.10, higher_is_better=True), 0.35),
+            (_linear_score(cagr, good=0.15, bad=-0.05, higher_is_better=True), 0.35),
+            (_linear_score(rev_growth, good=0.20, bad=-0.10, higher_is_better=True), 0.30),
         ])
 
         # --- L4 Safety ---
@@ -351,10 +488,35 @@ def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
         interest_expense = fy.get("interest_expense")
         interest_coverage = (ebit / abs(interest_expense)) if (ebit is not None and interest_expense) else None
 
-        layers["L4_safety"] = _average([
-            _linear_score(de_ratio, good=0, bad=2.0, higher_is_better=False),
-            _linear_score(current_ratio, good=2.5, bad=0.5, higher_is_better=True),
-            _linear_score(interest_coverage, good=10, bad=1, higher_is_better=True),
+        # Altman Z''-Score (emerging-markets variant, no X5 industry term) --
+        # same formula as backend/layer1_quality.py's live-app L1, reused
+        # here since it's already a proven, tested calculation.
+        altman_score = None
+        retained_earnings = fy.get("retained_earnings")
+        total_liabilities = fy.get("total_liabilities")
+        if (
+            assets and current_assets is not None and current_liab is not None
+            and retained_earnings is not None and ebit is not None
+            and total_liabilities and equity is not None
+        ):
+            working_capital = current_assets - current_liab
+            x1 = working_capital / assets
+            x2 = retained_earnings / assets
+            x3 = ebit / assets
+            x4 = equity / total_liabilities
+            altman_z = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4
+            if altman_z >= 2.6:
+                altman_score = 100.0
+            elif altman_z >= 1.1:
+                altman_score = 50.0
+            else:
+                altman_score = 0.0
+
+        layers["L4_safety"] = _weighted_average([
+            (altman_score, 0.35),
+            (_linear_score(interest_coverage, good=10, bad=1, higher_is_better=True), 0.25),
+            (_linear_score(de_ratio, good=0, bad=2.0, higher_is_better=False), 0.25),
+            (_linear_score(current_ratio, good=2.5, bad=0.5, higher_is_better=True), 0.15),
         ])
 
         # --- L5 Efficiency ---
@@ -365,10 +527,14 @@ def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
         op_cf = fy.get("operating_cashflow")
         ocf_ni = (op_cf / net_income) if (op_cf is not None and net_income and net_income > 0) else None
 
-        layers["L5_efficiency"] = _average([
-            None if asset_turnover is None else max(0.0, min(1.0, asset_turnover / 1.0)) * 100,
-            None if inventory_turnover is None else max(0.0, min(1.0, inventory_turnover / 8.0)) * 100,
-            _linear_score(ocf_ni, good=1.5, bad=0, higher_is_better=True),
+        accounts_receivable = fy.get("accounts_receivable")
+        receivables_days = (accounts_receivable / revenue * 365) if (accounts_receivable is not None and revenue and revenue > 0) else None
+
+        layers["L5_efficiency"] = _weighted_average([
+            (_linear_score(ocf_ni, good=1.5, bad=0, higher_is_better=True), 0.30),
+            (None if asset_turnover is None else max(0.0, min(1.0, asset_turnover / 1.0)) * 100, 0.30),
+            (_linear_score(receivables_days, good=30, bad=90, higher_is_better=False), 0.25),
+            (None if inventory_turnover is None else max(0.0, min(1.0, inventory_turnover / 8.0)) * 100, 0.15),
         ])
 
         # --- L6 Dividends ---
@@ -391,13 +557,28 @@ def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
                 payout_score = 20.0
             else:
                 payout_score = 70.0
-            layers["L6_dividends"] = _average([yield_score, payout_score])
+
+            dps_growth_score = None
+            if dividends is not None and not dividends.empty:
+                prev_year_divs = dividends[dividends.index.year == year - 1]
+                prev_annual_dividend = float(prev_year_divs.sum()) if not prev_year_divs.empty else None
+                if prev_annual_dividend:
+                    dps_growth = (annual_dividend - prev_annual_dividend) / abs(prev_annual_dividend)
+                    dps_growth_score = _linear_score(dps_growth, good=0.10, bad=-0.20, higher_is_better=True)
+
+            layers["L6_dividends"] = _weighted_average([
+                (yield_score, 0.40),
+                (payout_score, 0.35),
+                (dps_growth_score, 0.25),
+            ])
     else:
         layers.update({k: None for k in ["L1_valuation", "L2_profitability", "L3_growth", "L4_safety", "L5_efficiency", "L6_dividends"]})
 
     # --- L7 Momentum (price-based, works for crypto too) ---
     price_return = ((year_end_price / year_start_price) - 1) if (year_end_price and year_start_price) else None
-    rsi_val = _rsi(price_history_to_date["Close"]) if not price_history_to_date.empty else None
+    closes_to_date = price_history_to_date["Close"] if not price_history_to_date.empty else pd.Series(dtype=float)
+
+    rsi_val = _rsi(closes_to_date)
     rsi_score = None
     if rsi_val is not None:
         if rsi_val > 70 or rsi_val < 30:
@@ -405,18 +586,13 @@ def compute_prism_score(ticker_data: dict, year: int, macro: dict) -> dict:
         else:
             rsi_score = 100 - abs(rsi_val - 55) * 1.2
 
-    golden_cross_bonus = 0.0
-    if len(price_history_to_date) >= 200:
-        ma50 = price_history_to_date["Close"].rolling(50).mean().iloc[-1]
-        ma200 = price_history_to_date["Close"].rolling(200).mean().iloc[-1]
-        if pd.notna(ma50) and pd.notna(ma200) and ma50 > ma200:
-            golden_cross_bonus = 10.0
-
-    momentum_score = _average([
-        _linear_score(price_return, good=0.30, bad=-0.20, higher_is_better=True),
-        rsi_score,
+    layers["L7_momentum"] = _weighted_average([
+        (_linear_score(price_return, good=0.30, bad=-0.20, higher_is_better=True), 0.25),
+        (_sma_cross_score(closes_to_date), 0.20),
+        (rsi_score, 0.20),
+        (_macd_score(closes_to_date), 0.20),
+        (_bollinger_score(closes_to_date), 0.15),
     ])
-    layers["L7_momentum"] = None if momentum_score is None else min(100.0, momentum_score + golden_cross_bonus)
 
     # --- L8 ESG ---
     esg_score = ticker_data.get("esg_score")

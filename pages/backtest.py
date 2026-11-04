@@ -59,7 +59,14 @@ st.markdown(
 
 st.sidebar.markdown("## Backtest Settings")
 
-ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL").upper().strip()
+# A watchlist card's "BACKTEST" link (see frontend/ui_landing.py) lands here
+# as ?ticker=XYZ -- prefill the field with it and auto-run once per distinct
+# incoming ticker, same auto-run convenience pattern as the main app's
+# landing-page cards (app.py's pending_auto_analyze).
+query_ticker = st.query_params.get("ticker")
+default_ticker = (query_ticker or "AAPL").upper().strip()
+
+ticker = st.sidebar.text_input("Ticker Symbol", value=default_ticker).upper().strip()
 period_label = st.sidebar.selectbox("Lookback Period", list(PERIOD_OPTIONS.keys()), index=0)
 rebalance_label = st.sidebar.selectbox("Rebalance Frequency", list(REBALANCE_OPTIONS.keys()), index=0)
 
@@ -82,7 +89,11 @@ except Exception:
 if not has_fred_key:
     st.sidebar.caption("FRED API key not set -- risk-free rate will default to 4%.")
 
-if run_btn:
+auto_run = bool(query_ticker) and st.session_state.get("bt_autorun_ticker") != query_ticker
+if auto_run:
+    st.session_state["bt_autorun_ticker"] = query_ticker
+
+if run_btn or auto_run:
     period_years = PERIOD_OPTIONS[period_label]
     rebalance = REBALANCE_OPTIONS[rebalance_label]
     try:

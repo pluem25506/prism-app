@@ -104,8 +104,13 @@ def _render_pulse_card(ticker: str, name: str, data):
         margin-bottom: 10px;
         min-height: 110px;
     ">
-        <div style="font-size:0.7rem; color:#888; font-weight:600;
-                    letter-spacing:0.05em;">{ticker}</div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:0.7rem; color:#888; font-weight:600;
+                        letter-spacing:0.05em;">{ticker}</span>
+            <a href="/backtest?ticker={ticker}" target="_self" style="font-size:0.6rem;
+               color:#D4A017; border:1px solid #D4A017; border-radius:4px; padding:1px 6px;
+               text-decoration:none; font-weight:600; letter-spacing:0.03em;">BACKTEST</a>
+        </div>
         <div style="font-size:0.85rem; font-weight:700;
                     white-space:nowrap; overflow:hidden;
                     text-overflow:ellipsis;">{name}</div>

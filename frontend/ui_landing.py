@@ -104,13 +104,8 @@ def _render_pulse_card(ticker: str, name: str, data):
         margin-bottom: 10px;
         min-height: 110px;
     ">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:0.7rem; color:#888; font-weight:600;
-                        letter-spacing:0.05em;">{ticker}</span>
-            <a href="/backtest?ticker={ticker}" target="_self" style="font-size:0.6rem;
-               color:#D4A017; border:1px solid #D4A017; border-radius:4px; padding:1px 6px;
-               text-decoration:none; font-weight:600; letter-spacing:0.03em;">BACKTEST</a>
-        </div>
+        <div style="font-size:0.7rem; color:#888; font-weight:600;
+                    letter-spacing:0.05em;">{ticker}</div>
         <div style="font-size:0.85rem; font-weight:700;
                     white-space:nowrap; overflow:hidden;
                     text-overflow:ellipsis;">{name}</div>
@@ -124,12 +119,25 @@ def _render_pulse_card(ticker: str, name: str, data):
     </div>
     """, unsafe_allow_html=True)
 
-    # Analyze button below card
-    if st.button("Analyze", key=f"btn_{ticker}", width="stretch"):
-        st.session_state["selected_ticker"] = ticker
-        st.session_state["run_analysis"] = True
-        st.session_state["pending_auto_analyze"] = True
-        st.rerun()
+    # Analyze / Backtest buttons below card.
+    # A raw HTML <a href="/backtest?..."> badge was tried first for a true
+    # top-right-corner look, but Streamlit Cloud serves the app inside a
+    # sandboxed iframe (no allow-top-navigation) -- a real cross-document
+    # link from inside that iframe to a root-relative path breaks (white
+    # page, bounced back to the landing page), which only showed up on the
+    # deployed app, not in local dev (no iframe there). st.switch_page()
+    # uses Streamlit's own internal client-side routing instead of a real
+    # page load, so it stays correct under that sandbox either way.
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("Analyze", key=f"btn_{ticker}", width="stretch"):
+            st.session_state["selected_ticker"] = ticker
+            st.session_state["run_analysis"] = True
+            st.session_state["pending_auto_analyze"] = True
+            st.rerun()
+    with btn_col2:
+        if st.button("Backtest", key=f"bt_{ticker}", width="stretch"):
+            st.switch_page("pages/backtest.py", query_params={"ticker": ticker})
 
 
 def show_landing_page():

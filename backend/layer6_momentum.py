@@ -31,9 +31,14 @@ def _bollinger_score(closes, period: int = 20, n_std: float = 2.0):
     return 55.0
 
 
-def compute_layer6(ticker: str, year: int | None = None) -> dict:
+def compute_layer6(ticker: str, year: int | None = None, as_of_date=None) -> dict:
+    """as_of_date, when given, takes priority over `year` for the window's
+    end point -- lets the Backtest engine refresh this purely price-based
+    layer more often than once a fiscal year (Daily/Weekly/Monthly
+    rebalancing), while fundamentals-based layers stay pinned to `year`."""
     price_history = fetch_price_history_long(ticker)
-    df = slice_price_window(price_history, year, lookback_days=400)  # a little slack for the 200D MA warm-up
+    as_of = as_of_date if as_of_date is not None else year
+    df = slice_price_window(price_history, as_of, lookback_days=400)  # a little slack for the 200D MA warm-up
 
     if df.empty or len(df) < 60:
         return {"S6": 50, "data_quality": "stub", "details": ["Insufficient price history"]}

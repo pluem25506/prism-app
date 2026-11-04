@@ -46,7 +46,15 @@ BLUE = "#60A5FA"
 SIGNAL_COLORS = {"BUY": GREEN, "HOLD": AMBER, "SELL": RED}
 
 PERIOD_OPTIONS = {"10 Years": 10, "15 Years": 15, "20 Years": 20, "Max Available": "max"}
-REBALANCE_OPTIONS = {"Annual (Jan 1)": "annual", "Semi-Annual": "semiannual", "Quarterly": "quarterly"}
+# Monthly/Weekly/Daily recompute the price-based layers (Risk, Time-Series
+# Momentum, Contextual Intel) fresh at every rebalance date instead of once
+# a year -- the fundamentals-based layers (Quality, Value, Valuation, Monte
+# Carlo, Leverage) still only update once a fiscal year regardless, since
+# yfinance's annual statements don't change any more often than that.
+REBALANCE_OPTIONS = {
+    "Annual (Jan 1)": "annual", "Semi-Annual": "semiannual", "Quarterly": "quarterly",
+    "Monthly": "monthly", "Weekly": "weekly", "Daily": "daily",
+}
 
 
 def _badge(text: str, color: str) -> str:
@@ -78,6 +86,11 @@ default_ticker = (query_ticker or "AAPL").upper().strip()
 ticker = st.sidebar.text_input("Ticker Symbol", value=default_ticker).upper().strip()
 period_label = st.sidebar.selectbox("Lookback Period", list(PERIOD_OPTIONS.keys()), index=0)
 rebalance_label = st.sidebar.selectbox("Rebalance Frequency", list(REBALANCE_OPTIONS.keys()), index=0)
+if REBALANCE_OPTIONS[rebalance_label] in ("daily", "weekly") and period_label in ("15 Years", "20 Years", "Max Available"):
+    st.sidebar.caption(
+        f"{rebalance_label} rebalancing over {period_label.lower()} recomputes risk/momentum/contextual "
+        "scores at every one of those dates -- this run may take a couple of minutes the first time."
+    )
 
 benchmark_choice = st.sidebar.selectbox("Benchmark", ["SPY", "QQQ", "DIA", "BTC-USD", "Custom..."], index=0)
 if benchmark_choice == "Custom...":

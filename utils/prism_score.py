@@ -1,25 +1,39 @@
 """
 PRISM Backtest Engine -- simulation harness only.
 
-As of this rewrite, the actual 9-layer scoring is no longer a separate
-parallel implementation here -- it calls backend.prism_score.compute_prism_score
+The actual 9-layer scoring is backend.prism_score.compute_prism_score
 (ticker, year), the exact same scorer the live Analyze page uses, just
-pointed at a historical fiscal year instead of today. This module now only
-owns what's specific to backtesting: fetching a long price history, running
-the year-by-year scoring loop, simulating the BUY/HOLD/SELL strategy at each
-rebalance date, building the equity curve, and computing summary stats.
+pointed at a historical fiscal year instead of today. This module owns
+what's specific to backtesting: fetching a long price history, running the
+year-by-year scoring loop (for the yearly display charts), simulating the
+BUY/HOLD/SELL strategy at each rebalance date, building the equity curve,
+and computing summary stats.
+
+Rebalance granularity and the "frozen fundamentals" design:
+L1/L2/L3/L5/L8 are fundamentals-based -- yfinance's annual statements only
+update once a fiscal year, so there is nothing to gain by recomputing them
+more than once per year, and doing so for L5 in particular (a 10,000-path
+Monte Carlo simulation) would be the dominant cost of a Daily backtest for
+no benefit. L4/L6/L9 are price-based and genuinely change day to day, so at
+Weekly/Daily rebalancing the *trade signal* recomputes those three fresh at
+every rebalance date while reusing the already-computed (and cached) yearly
+values for the other five -- not a second, separate "fast path" model, just
+the same layers evaluated at the granularity each one actually supports.
 
 L7 Portfolio Fit is always unavailable here (it depends on the user's
-*current* holdings, which has no historical meaning) -- backend.prism_score
-already returns S7=None for any explicit year, and the composite score
-renormalizes around it automatically, same as any other missing layer.
+*current* holdings, which has no historical meaning) -- excluded from the
+composite the same way any other missing layer is, via weight
+renormalization.
 """
 
 import pandas as pd
 import streamlit as st
 
 from backend.data_fetcher import fetch_price_history_long
-from backend.prism_score import WEIGHTS, compute_prism_score
+from backend.layer4_risk import calculate_risk_score
+from backend.layer6_momentum import compute_layer6
+from backend.layer9_contextual import compute_layer9
+from backend.prism_score import WEIGHTS, compute_layer1, compute_layer2, compute_layer3, compute_layer5, compute_layer8, compute_prism_score
 
 DEFAULT_RISK_FREE_RATE = 0.04
 
@@ -29,6 +43,11 @@ LAYER_LABELS = {
     "S7": "Portfolio Fit (N/A historically)", "S8": "Operating & Financial Leverage",
     "S9": "Contextual Intelligence",
 }
+
+# L7 excluded: no historical meaning (depends on today's actual holdings).
+_BACKTEST_LAYERS = [k for k in WEIGHTS if k != "S7"]
+_YEARLY_LAYERS = {"S1", "S2", "S3", "S5", "S8"}  # fundamentals-based -- frozen per fiscal year
+_DATED_LAYERS = {"S4", "S6", "S9"}  # price-based -- refresh at every rebalance date
 
 
 @st.cache_data(ttl=3600)
@@ -44,7 +63,45 @@ def fetch_stock_data(ticker: str, period_years) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def _cached_score_for_year(ticker: str, year: int) -> dict:
+    """Full 9-layer score for one fiscal year -- used for the Score
+    Timeline / Layer Breakdown charts, which are always shown per-year
+    regardless of rebalance frequency."""
     return compute_prism_score(ticker, year)
+
+
+@st.cache_data(ttl=3600)
+def _cached_yearly_layers(ticker: str, year: int) -> dict:
+    """L1/L2/L3/L5/L8 only, cached per (ticker, year) -- reused across
+    every rebalance date within that year so Monte Carlo's 10,000-path
+    simulation (and the others) run once per year, not once per rebalance
+    date, at Weekly/Daily granularity."""
+    return {
+        "S1": compute_layer1(ticker, year).get("S1"),
+        "S2": compute_layer2(ticker, year).get("S2"),
+        "S3": compute_layer3(ticker, year).get("S3"),
+        "S5": compute_layer5(ticker, year).get("S5"),
+        "S8": compute_layer8(ticker, year).get("S8"),
+    }
+
+
+@st.cache_data(ttl=3600)
+def _cached_dated_layers(ticker: str, year: int, as_of_date, fred_key: str) -> dict:
+    """L4/L6/L9 only, cached per (ticker, as_of_date) -- these are
+    purely price/macro-based and refresh at every rebalance date."""
+    return {
+        "S4": calculate_risk_score(ticker, year, as_of_date).get("S4"),
+        "S6": compute_layer6(ticker, year, as_of_date).get("S6"),
+        "S9": compute_layer9(ticker, fred_key, year, as_of_date).get("S9"),
+    }
+
+
+def _score_at_date(ticker: str, year: int, as_of_date, fred_key: str) -> float:
+    yearly = _cached_yearly_layers(ticker, year)
+    dated = _cached_dated_layers(ticker, year, as_of_date, fred_key)
+    sub_scores = {**yearly, **dated}
+    available = {k: v for k, v in sub_scores.items() if v is not None and k in _BACKTEST_LAYERS}
+    total_weight = sum(WEIGHTS[k] for k in available)
+    return sum(WEIGHTS[k] * v for k, v in available.items()) / total_weight if total_weight else 50.0
 
 
 def score_to_signal(score: float, buy_threshold: float, sell_threshold: float) -> str:
@@ -67,8 +124,33 @@ _REBALANCE_MONTHS = {
 
 
 def _rebalance_dates(daily_prices: pd.DataFrame, rebalance: str):
-    """First trading day on/after the 1st of each rebalance month, for every
-    year the ticker has price data."""
+    """Rebalance dates at the chosen frequency, snapped to real trading
+    days. "daily" is every trading day; "weekly" is the first trading day
+    of each ISO week; the month-anchored frequencies are unchanged."""
+    if rebalance == "daily":
+        return list(daily_prices.index)
+
+    if rebalance == "weekly":
+        iso = daily_prices.index.isocalendar()
+        week_keys = list(zip(iso["year"], iso["week"]))
+        dates = []
+        seen = set()
+        for date, key in zip(daily_prices.index, week_keys):
+            if key not in seen:
+                seen.add(key)
+                dates.append(date)
+        return dates
+
+    if rebalance == "monthly":
+        dates = []
+        seen = set()
+        for date in daily_prices.index:
+            key = (date.year, date.month)
+            if key not in seen:
+                seen.add(key)
+                dates.append(date)
+        return dates
+
     months = _REBALANCE_MONTHS[rebalance]
     years = sorted(set(daily_prices.index.year))
     dates = []
@@ -107,6 +189,12 @@ def run_backtest(
     start_year = int(daily_prices.index[0].year)
     end_year = int(daily_prices.index[-1].year)
 
+    try:
+        fred_key = st.secrets.get("FRED_API_KEY", "")
+    except Exception:
+        fred_key = ""
+
+    # --- Yearly scores, for the Score Timeline / Layer Breakdown charts ---
     rows = []
     for year in range(start_year, end_year + 1):
         result = _cached_score_for_year(ticker, year)
@@ -121,7 +209,10 @@ def run_backtest(
         rows.append(row)
     scores_df = pd.DataFrame(rows).set_index("year")
 
-    # --- Simulate the strategy at each rebalance date ---
+    # --- Simulate the strategy at each rebalance date, at the chosen
+    # granularity -- Daily/Weekly/Monthly recompute L4/L6/L9 fresh at every
+    # date (see _score_at_date); fundamentals-based layers (L1/L2/L3/L5/L8)
+    # stay pinned to that date's fiscal year regardless of granularity.
     rebal_dates = _rebalance_dates(daily_prices, rebalance)
     trade_log = []
     invested = False
@@ -131,8 +222,8 @@ def run_backtest(
         year = date.year
         if year not in scores_df.index:
             continue
-        score = scores_df.loc[year, "score"]
-        signal = scores_df.loc[year, "signal"]
+        score = _score_at_date(ticker, year, date, fred_key)
+        signal = score_to_signal(score, buy_threshold, sell_threshold)
         price_at_date = float(daily_prices.loc[daily_prices.index <= date, "Close"].iloc[-1])
 
         if signal == "BUY" and not invested:

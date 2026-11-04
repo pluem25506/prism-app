@@ -16,16 +16,21 @@ def _is_thai(ticker: str) -> bool:
     return ticker.upper().endswith(".BK")
 
 
-def compute_rs_ratio(ticker: str, year: int | None = None) -> dict:
+def compute_rs_ratio(ticker: str, year: int | None = None, as_of_date=None) -> dict:
     """Relative Strength ratio vs THD (Thai tickers) or ^GSPC (everything
     else) -- Yahoo's own SET index symbols only ever return a single day of
-    history via yfinance, confirmed by direct testing."""
+    history via yfinance, confirmed by direct testing.
+
+    as_of_date, when given, takes priority over `year` for the window's
+    end point, letting this purely price-based metric refresh more often
+    than once a fiscal year (Backtest's Daily/Weekly/Monthly rebalancing)."""
     benchmark = get_benchmark_ticker(ticker)
+    as_of = as_of_date if as_of_date is not None else year
     try:
         stock_history = fetch_price_history_long(ticker)
         bench_history = fetch_price_history_long(benchmark)
-        stock_px = slice_price_window(stock_history, year)["Close"] if not stock_history.empty else stock_history
-        bench_px = slice_price_window(bench_history, year)["Close"] if not bench_history.empty else bench_history
+        stock_px = slice_price_window(stock_history, as_of)["Close"] if not stock_history.empty else stock_history
+        bench_px = slice_price_window(bench_history, as_of)["Close"] if not bench_history.empty else bench_history
 
         if stock_px.empty or bench_px.empty:
             return {"rs_ratio": None, "rs_score": 50, "error": "no data", "benchmark": benchmark}
@@ -110,9 +115,9 @@ def compute_macro_score(ticker: str, fred_key: str | None = None, year: int | No
     }
 
 
-def compute_layer9(ticker: str, fred_key: str | None = None, year: int | None = None) -> dict:
-    rs = compute_rs_ratio(ticker, year)
-    macro = compute_macro_score(ticker, fred_key, year)
+def compute_layer9(ticker: str, fred_key: str | None = None, year: int | None = None, as_of_date=None) -> dict:
+    rs = compute_rs_ratio(ticker, year, as_of_date)
+    macro = compute_macro_score(ticker, fred_key, year)  # FRED series are annual at best -- no finer granularity to gain
 
     rs_score = rs.get("rs_score", 50)
     macro_score = macro.get("macro_score", 50)

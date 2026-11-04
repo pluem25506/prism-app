@@ -27,8 +27,8 @@ _RF_ANNUAL = 0.028
 _TRADING_DAYS = 252
 
 
-def _returns_for(ticker, price_history, year):
-    window = slice_price_window(price_history, year)
+def _returns_for(ticker, price_history, as_of):
+    window = slice_price_window(price_history, as_of)
     if window.empty:
         return pd.Series(dtype=float)
     return window["Close"].pct_change().dropna()
@@ -46,13 +46,13 @@ def _compute_var_cvar(returns):
     return var_95, var_99, cvar_95, cvar_99
 
 
-def _compute_beta(ticker, returns, year):
+def _compute_beta(ticker, returns, as_of):
     """Beta vs THD (Thai tickers) or ^GSPC (everything else), over the same
     window as `returns`."""
     try:
         benchmark = get_benchmark_ticker(ticker)
         bench_history = fetch_price_history_long(benchmark)
-        bench_window = slice_price_window(bench_history, year)
+        bench_window = slice_price_window(bench_history, as_of)
         if bench_window.empty:
             raise ValueError("no benchmark data")
         bench_returns = bench_window["Close"].pct_change().dropna()
@@ -123,15 +123,23 @@ def _map_beta(beta):
     return 20.0
 
 
-def calculate_risk_score(ticker: str, year: int | None = None) -> dict:
+def calculate_risk_score(ticker: str, year: int | None = None, as_of_date=None) -> dict:
     """Compute S4 (risk, 0-100) from Sharpe (40%), historical VaR (30%), and
-    beta vs the market (30%), over the trailing year ending today (live) or
-    ending at a historical fiscal year (Backtest)."""
+    beta vs the market (30%), over the trailing year ending today (live),
+    ending at a historical fiscal year (Backtest, annual granularity), or
+    ending at a specific rebalance date (Backtest, sub-annual granularity).
+
+    as_of_date, when given, takes priority over `year` for the price
+    window's end point -- `year` still selects which fiscal year's
+    fundamentals-based layers (L1/L2/L3/L5/L8) apply, but L4 is purely
+    price-based and can refresh more often than once a year.
+    """
     price_history = fetch_price_history_long(ticker)
-    returns = _returns_for(ticker, price_history, year)
+    as_of = as_of_date if as_of_date is not None else year
+    returns = _returns_for(ticker, price_history, as_of)
 
     var_95, var_99, cvar_95, cvar_99 = _compute_var_cvar(returns)
-    beta, beta_source = _compute_beta(ticker, returns, year)
+    beta, beta_source = _compute_beta(ticker, returns, as_of)
     sharpe = _compute_sharpe(returns)
     garch_vol, garch_source = _compute_garch_vol(returns)
 

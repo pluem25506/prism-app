@@ -194,18 +194,26 @@ def get_benchmark_ticker(ticker: str) -> str:
     return "THD" if ticker.upper().endswith(".BK") else "^GSPC"
 
 
-def slice_price_window(df: pd.DataFrame, as_of_year, lookback_days: int = 365) -> pd.DataFrame:
-    """Trailing `lookback_days` of daily prices ending at the last trading
-    day on/before Dec 31 of `as_of_year`, or through the most recent
-    available trading day if as_of_year is None (live mode) -- NOT the
-    unsliced full history; every caller (L4/L5/L6/L9) wants "trailing ~1y"
-    either way, just anchored at today vs a historical year-end."""
+def slice_price_window(df: pd.DataFrame, as_of, lookback_days: int = 365) -> pd.DataFrame:
+    """Trailing `lookback_days` of daily prices ending at:
+      - the most recent available trading day, if as_of is None (live mode)
+      - Dec 31 of as_of, if as_of is an int (a fiscal year -- the Backtest
+        engine's original per-year granularity)
+      - as_of itself, if as_of is a date/Timestamp (the Backtest engine's
+        finer-than-annual rebalancing -- a specific rebalance date, not
+        just a year-end)
+
+    NOT the unsliced full history; every caller (L4/L5/L6/L9) wants
+    "trailing ~1y" either way, just anchored at a different point in time.
+    """
     if df is None or df.empty:
         return df
-    if as_of_year is None:
+    if as_of is None:
         end = df.index[-1]
+    elif isinstance(as_of, int):
+        end = pd.Timestamp(year=as_of, month=12, day=31)
     else:
-        end = pd.Timestamp(year=as_of_year, month=12, day=31)
+        end = pd.Timestamp(as_of)
     window = df[df.index <= end]
     if window.empty:
         return window

@@ -20,9 +20,11 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from frontend.ui_theme import inject_sidebar_nav_style
 from utils.prism_score import LAYER_WEIGHTS, run_backtest
 
 st.set_page_config(page_title="PRISM Backtest Engine", layout="wide")
+inject_sidebar_nav_style()
 
 BG = "#0B1120"
 CARD_BG = "#131D30"

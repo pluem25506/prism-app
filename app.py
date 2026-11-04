@@ -1,6 +1,7 @@
 import streamlit as st
 
 from frontend.ui_sidebar import render_sidebar
+from frontend.ui_theme import inject_sidebar_nav_style
 from frontend.ui_company import render_company_profile
 from frontend.ui_score import render_score_card
 from frontend.ui_charts import render_contextual_intel, render_esg_table, render_montecarlo_chart, render_risk_table, render_score_bar
@@ -14,6 +15,7 @@ st.set_page_config(
     page_title="PRISM v2.1 | Quantitative Investment Analysis",
     layout="wide",
 )
+inject_sidebar_nav_style()
 
 # Session state: landing page is shown until the user runs an analysis
 # (either via the sidebar or a watchlist card on the landing page).

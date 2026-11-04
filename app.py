@@ -23,7 +23,6 @@ if "run_analysis" not in st.session_state:
     st.session_state["run_analysis"] = False
 
 ticker, clicked = render_sidebar()
-st.sidebar.page_link("pages/backtest.py", label="Backtest Engine")
 
 # Set by a landing-page card/search click (see frontend/ui_landing.py) to
 # auto-run the analysis for the pre-filled ticker without an extra click.
